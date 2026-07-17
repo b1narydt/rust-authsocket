@@ -1,0 +1,49 @@
+[package]
+name = "authsocket"
+version = "0.1.0"
+edition = "2021"
+description = "BRC-103 mutually-authenticated Socket.IO for Rust — a faithful port of the TS @bsv authsocket / authsocket-client, sharing one wire contract across a socketioxide server and a rust_socketio client. Every application event (incl. room broadcasts) is signed and verified through a bsv-sdk BRC-103 Peer."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/b1narydt/rust-authsocket"
+
+[features]
+# Default builds only the transport-agnostic core (wire codec + ChannelTransport
+# + PeerHandle) — always compiles, no Socket.IO backend pulled.
+default = []
+# Server side: the transport-agnostic AuthSocketServer room core plus the
+# socketioxide adapter (matches rust-messagebox-server).
+server = ["dep:socketioxide"]
+# Client side: AuthSocketClient over rust_socketio (matches
+# rust-messagebox-client).
+client = ["dep:rust_socketio"]
+
+[dependencies]
+# BRC-103 auth engine (Peer, Transport, AuthMessage) — we wrap, never reimplement.
+# Pinned to the same 0.3 git rev as rust-mpc and rust-messagebox-client so one
+# bsv-sdk package (and its AuthMessage/Peer types) is shared across the graph.
+# version (crates.io) is what the published crate declares; the git rev is used
+# for local dev/CI so authsocket builds on the exact same bsv-sdk as the rest of
+# the graph. cargo strips the git/rev on publish, leaving `bsv-sdk = "0.3.1"`.
+# Consumers pin the rev graph-wide via [patch.crates-io], so one copy is shared.
+bsv-sdk = { version = "0.3.1", git = "https://github.com/b1narydt/bsv-rust-sdk.git", rev = "102abf703289ea8459167c4b2954e5cd94fce8d5", features = ["network"] }
+
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+# Brief, non-poisoning map locks (per-socket Arc cloned out; never held across await).
+parking_lot = "0.12"
+# join_all for concurrent per-member broadcast signing.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# Socket.IO backends (optional, behind the `server` / `client` features).
+socketioxide = { version = "0.15", optional = true }
+rust_socketio = { version = "0.6", features = ["async"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+# End-to-end test: a real socketioxide server behind axum + the rust_socketio
+# client, over loopback (tests/e2e.rs, requires --features server,client).
+axum = "0.8"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
