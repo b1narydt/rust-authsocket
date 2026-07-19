@@ -1,6 +1,6 @@
 [package]
 name = "authsocket"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "BRC-103 mutually-authenticated Socket.IO for Rust — a faithful port of the TS @bsv authsocket / authsocket-client, sharing one wire contract across a socketioxide server and a rust_socketio client. Every application event (incl. room broadcasts) is signed and verified through a bsv-sdk BRC-103 Peer."
 license = "MIT OR Apache-2.0"
@@ -19,13 +19,12 @@ client = ["dep:rust_socketio"]
 
 [dependencies]
 # BRC-103 auth engine (Peer, Transport, AuthMessage) — we wrap, never reimplement.
-# Pinned to the same 0.3 git rev as rust-mpc and rust-messagebox-client so one
-# bsv-sdk package (and its AuthMessage/Peer types) is shared across the graph.
-# version (crates.io) is what the published crate declares; the git rev is used
-# for local dev/CI so authsocket builds on the exact same bsv-sdk as the rest of
-# the graph. cargo strips the git/rev on publish, leaving `bsv-sdk = "0.3.1"`.
-# Consumers pin the rev graph-wide via [patch.crates-io], so one copy is shared.
-bsv-sdk = { version = "0.3.1", git = "https://github.com/b1narydt/bsv-rust-sdk.git", rev = "102abf703289ea8459167c4b2954e5cd94fce8d5", features = ["network"] }
+# Plain crates.io dependency: the whole consumer graph (rust-mpc,
+# rust-messagebox-client) moved off git pins onto the published bsv-sdk, and a
+# git-pinned copy here would split the graph into two bsv-sdk packages whose
+# WalletInterface/Peer types don't unify. ^0.3.1 resolves to the same single
+# crates.io copy consumers use.
+bsv-sdk = { version = "0.3.1", features = ["network"] }
 
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 async-trait = "0.1"

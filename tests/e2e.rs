@@ -179,6 +179,51 @@ async fn full_handshake_room_and_signed_broadcast() {
     client.disconnect().await.expect("disconnect");
 }
 
+/// Presence self-heal: the keepalive probe re-asserts the client's room
+/// membership, so even if the server loses it (deploy skew, missed join),
+/// routability is restored within one keepalive interval — without any
+/// reconnect.
+#[tokio::test]
+async fn keepalive_reasserts_lost_room_membership() {
+    let (url, core, _seen_rx) = boot_server().await;
+    let client_identity = identity_of(CLIENT_KEY).await;
+
+    let wallet = ProtoWallet::new(PrivateKey::from_hex(CLIENT_KEY).expect("key"));
+    let client = AuthSocketClient::connect(&url, &client_identity, wallet)
+        .await
+        .expect("connect + handshake");
+
+    let room = format!("{client_identity}-test_inbox");
+    client.join_room(&room).await.expect("join_room");
+
+    // Wait for the join to register server-side.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while core.room_members(&room).is_empty() {
+        assert!(std::time::Instant::now() < deadline, "join never registered");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let sid = core.room_members(&room)[0].clone();
+
+    // Server-side membership loss (the skew a deploy can produce).
+    core.leave_room(&sid, &room);
+    assert!(core.room_members(&room).is_empty(), "membership force-dropped");
+
+    // The next keepalive probe (≤2s + processing) must re-assert it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+    loop {
+        if core.room_members(&room).contains(&sid) {
+            break; // healed
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "keepalive did not re-assert room membership within 6s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    client.disconnect().await.expect("disconnect");
+}
+
 /// The server must reject joining a room the client's verified identity does
 /// not own: no membership, no signed broadcast reaches the client.
 #[tokio::test]

@@ -163,6 +163,24 @@ async fn handle_verified_event<W>(
             // contract — never a raw event). Also serves as the keepalive
             // reply that refreshes the client's read deadline.
             let identity = server.identity_key(sid).unwrap_or_default();
+            // Presence self-heal: the keepalive carries the rooms the client
+            // believes it belongs to; re-assert each membership (same own-room
+            // rule as joinRoom, and join_room is idempotent), so server-side
+            // routability can never silently rot while the socket is live —
+            // any skew heals within one keepalive interval.
+            if let Some(rooms) = ev.data.get("rooms").and_then(Value::as_array) {
+                for room_id in rooms.iter().filter_map(Value::as_str) {
+                    if room_id.is_empty() {
+                        continue;
+                    }
+                    if identity.is_empty() || !room_id.starts_with(&identity) {
+                        warn!(sid = %sid, room = %room_id,
+                            "authsocket: keepalive room re-assert rejected — identity mismatch");
+                        continue;
+                    }
+                    server.join_room(sid, room_id);
+                }
+            }
             emit_signed_to_socket(
                 socket,
                 server,

@@ -224,12 +224,24 @@ pub struct AuthSocketClient {
     handlers: HandlerMap,
     /// Fallback for events without an exact-match handler.
     fallback: Arc<Mutex<Option<FallbackHandler>>>,
-    /// Rooms currently joined (idempotency on join_room).
+    /// Rooms currently joined (idempotency on join_room; re-asserted in every
+    /// keepalive probe so hub-side membership self-heals).
     joined_rooms: Arc<Mutex<HashSet<String>>>,
     /// True once the server sends authenticationSuccess AND the socket is
     /// live. Flipped false by the watchdog on read-deadline expiry, by the
     /// dispatcher on channel close, and by the Close lifecycle handler.
     connected: Arc<AtomicBool>,
+    /// DEATH LATCH — set (never cleared) the moment any component declares the
+    /// socket dead: watchdog read-deadline expiry, Close lifecycle event, a
+    /// failed emit, keepalive failure, dispatcher channel close, or an explicit
+    /// `disconnect()`. `is_connected()` requires `!dead`, so a late
+    /// `authenticationSuccess` (e.g. a draining server flushing stale keepalive
+    /// replies) can re-store `connected` but can NEVER resurrect a client whose
+    /// watchdog/keepalive tasks have already exited — that resurrection left a
+    /// permanent zombie (`is_connected()` true, no watchdog running) the
+    /// consumer's supervisor could never heal. A client is single-flight:
+    /// once dead, the consumer must build a fresh one.
+    dead: Arc<AtomicBool>,
     /// Monotonic millis of the last inbound frame of ANY kind (watchdog
     /// half-open detection).
     last_inbound_ms: Arc<AtomicU64>,
@@ -252,6 +264,7 @@ impl AuthSocketClient {
         let fallback: Arc<Mutex<Option<FallbackHandler>>> = Arc::new(Mutex::new(None));
         let joined_rooms: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let connected = Arc::new(AtomicBool::new(false));
+        let dead = Arc::new(AtomicBool::new(false));
         // Read-deadline tracker: every inbound frame stamps this. Initialized
         // to "now" so the watchdog does not fire before the first frame.
         let last_inbound_ms = Arc::new(AtomicU64::new(now_ms()));
@@ -267,6 +280,7 @@ impl AuthSocketClient {
 
         let conn_clone = connected.clone();
         let conn_close_clone = connected.clone();
+        let dead_close_clone = dead.clone();
 
         // Socket.IO connect-ack gate. `rust_socketio::connect()` sends the
         // namespace CONNECT packet ("40") and returns immediately, without
@@ -318,10 +332,13 @@ impl AuthSocketClient {
                 }
                 .boxed()
             })
-            // Close: transport went away — mark disconnected.
+            // Close: transport went away — dead, terminally (a closed socket
+            // never comes back; the consumer reconnects with a fresh client).
             .on(Event::Close, move |_payload, _socket| {
                 let conn = conn_close_clone.clone();
+                let dead = dead_close_clone.clone();
                 async move {
+                    dead.store(true, Ordering::SeqCst);
                     conn.store(false, Ordering::SeqCst);
                 }
                 .boxed()
@@ -347,15 +364,26 @@ impl AuthSocketClient {
             .on_general_message()
             .expect("on_general_message take-once: fresh Peer");
 
+        // Any post-socket failure below must tear the socket down before
+        // returning: an errored connect that leaves the Socket.IO connection
+        // open leaks a live socket (and its server-side session) per attempt.
+        // `dead` is latched first so every spawned task exits promptly.
+        let abandon = |client: SocketClient, connected: Arc<AtomicBool>, dead: Arc<AtomicBool>| async move {
+            dead.store(true, Ordering::SeqCst);
+            connected.store(false, Ordering::SeqCst);
+            let _ = client.disconnect().await;
+        };
+
         // Hold the first emit until the namespace connect-ack arrives, so the
         // BRC-103 InitialRequest is never delivered ahead of the namespace
         // handshake.
         match tokio::time::timeout(CONNECT_ACK_TIMEOUT, connect_ready_rx.recv()).await {
             Ok(Some(())) => {}
             _ => {
+                abandon(client, connected, dead).await;
                 return Err(ClientError::WebSocket(
                     "Socket.IO connect-ack not received before timeout".into(),
-                ))
+                ));
             }
         }
 
@@ -364,16 +392,21 @@ impl AuthSocketClient {
         // and then delivers the signed `authenticated` general message. The ""
         // identity is resolved to the server's real key during the handshake.
         let auth_payload = encode_event("authenticated", &json!({ "identityKey": identity_key }));
-        peer.send_message("", auth_payload)
-            .await
-            .map_err(|e| ClientError::Handshake(e.to_string()))?;
+        if let Err(e) = peer.send_message("", auth_payload).await {
+            abandon(client, connected, dead).await;
+            return Err(ClientError::Handshake(e.to_string()));
+        }
 
         // The server identity key captured by the authMessage callback.
-        let server_identity_key = server_key_rx.try_recv().map_err(|_| {
-            ClientError::Handshake(
-                "handshake completed but server identity key not captured".into(),
-            )
-        })?;
+        let server_identity_key = match server_key_rx.try_recv() {
+            Ok(k) => k,
+            Err(_) => {
+                abandon(client, connected, dead).await;
+                return Err(ClientError::Handshake(
+                    "handshake completed but server identity key not captured".into(),
+                ));
+            }
+        };
 
         // Type-erased signer: N concurrent sends sign in parallel.
         let signer: Signer = {
@@ -393,14 +426,19 @@ impl AuthSocketClient {
 
         // Receive task: drives process_next() until tear-down. `process_next`
         // returns Ok(false) both for "no message yet" AND a disconnected
-        // transport, so it exits on `connected` flipping false — latched on
-        // the first observed true so it survives the pre-auth window.
+        // transport, so it exits on the death latch (or on `connected`
+        // flipping false — latched on the first observed true so it survives
+        // the pre-auth window).
         {
             let peer_for_recv = peer.clone();
             let connected_for_recv = connected.clone();
+            let dead_for_recv = dead.clone();
             tokio::spawn(async move {
                 let mut was_connected = false;
                 loop {
+                    if dead_for_recv.load(Ordering::SeqCst) {
+                        break;
+                    }
                     match peer_for_recv.process_next().await {
                         Ok(true) => {}
                         Ok(false) => {
@@ -428,39 +466,48 @@ impl AuthSocketClient {
 
         // Keepalive task: signed `authenticated` probe every KEEPALIVE_INTERVAL.
         // The server's signed authenticationSuccess reply refreshes the read
-        // deadline — the only liveness signal for an idle subscriber.
+        // deadline — the only liveness signal for an idle subscriber. The probe
+        // also carries a snapshot of our joined rooms: the server re-asserts
+        // that membership on every keepalive (own-room check unchanged), so
+        // hub-side routability self-heals within one keepalive interval even if
+        // a join was ever lost server-side.
         {
             let keepalive_signer = signer.clone();
             let keepalive_client = client.clone();
             let identity_for_keepalive = identity_key.to_string();
             let connected_for_keepalive = connected.clone();
+            let dead_for_keepalive = dead.clone();
+            let rooms_for_keepalive = joined_rooms.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(KEEPALIVE_INTERVAL);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 interval.tick().await; // skip the immediate first tick
-                let mut was_connected = false;
                 loop {
                     interval.tick().await;
-                    let live = connected_for_keepalive.load(Ordering::SeqCst);
-                    was_connected |= live;
-                    if !live {
-                        if was_connected {
-                            break; // socket declared dead — stop pinging
-                        }
+                    if dead_for_keepalive.load(Ordering::SeqCst) {
+                        break; // socket declared dead — stop pinging
+                    }
+                    if !connected_for_keepalive.load(Ordering::SeqCst) {
                         continue; // still coming up
                     }
+                    let rooms: Vec<String> = {
+                        let guard = rooms_for_keepalive.lock().await;
+                        guard.iter().cloned().collect()
+                    };
                     let ping = encode_event(
                         "authenticated",
-                        &json!({ "identityKey": identity_for_keepalive }),
+                        &json!({ "identityKey": identity_for_keepalive, "rooms": rooms }),
                     );
                     match keepalive_signer(ping).await {
                         Ok(signed) => {
                             if emit_auth_message(&keepalive_client, &signed).await.is_err() {
+                                dead_for_keepalive.store(true, Ordering::SeqCst);
                                 connected_for_keepalive.store(false, Ordering::SeqCst);
                                 break;
                             }
                         }
                         Err(_) => {
+                            dead_for_keepalive.store(true, Ordering::SeqCst);
                             connected_for_keepalive.store(false, Ordering::SeqCst);
                             break;
                         }
@@ -476,22 +523,25 @@ impl AuthSocketClient {
         {
             let watchdog_last_inbound = last_inbound_ms.clone();
             let watchdog_connected = connected.clone();
+            let watchdog_dead = dead.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(WATCHDOG_TICK);
-                let mut was_connected = false;
                 loop {
                     tick.tick().await;
-                    let live = watchdog_connected.load(Ordering::SeqCst);
-                    was_connected |= live;
-                    if !live {
-                        if was_connected {
-                            break;
-                        }
+                    if watchdog_dead.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if !watchdog_connected.load(Ordering::SeqCst) {
                         continue;
                     }
                     let last = watchdog_last_inbound.load(Ordering::SeqCst);
                     let elapsed = now_ms().saturating_sub(last);
                     if elapsed >= READ_DEADLINE.as_millis() as u64 {
+                        // Terminal verdict: latch the death flag FIRST so no
+                        // late frame (a draining server flushing stale
+                        // keepalive replies) can resurrect `connected` after
+                        // this task exits.
+                        watchdog_dead.store(true, Ordering::SeqCst);
                         watchdog_connected.store(false, Ordering::SeqCst);
                         tracing::warn!(
                             elapsed_ms = elapsed,
@@ -509,6 +559,7 @@ impl AuthSocketClient {
             let handlers = handlers.clone();
             let fallback = fallback.clone();
             let connected_for_dispatch = connected.clone();
+            let dead_for_dispatch = dead.clone();
             let last_inbound_for_dispatch = last_inbound_ms.clone();
             let mut general_msg_rx = general_msg_rx;
             tokio::spawn(async move {
@@ -521,6 +572,10 @@ impl AuthSocketClient {
                                 continue;
                             };
                             if event_name == "authenticationSuccess" {
+                                // Up-latch only: `is_connected()` also requires
+                                // `!dead`, so a stale reply arriving after the
+                                // watchdog's verdict cannot resurrect a dead
+                                // client.
                                 connected_for_dispatch.store(true, Ordering::SeqCst);
                                 let mut guard = auth_success_shared.lock().await;
                                 if let Some(tx) = guard.take() {
@@ -537,6 +592,7 @@ impl AuthSocketClient {
                         None => {
                             // Peer dropped (socket died) — make is_connected()
                             // trustworthy.
+                            dead_for_dispatch.store(true, Ordering::SeqCst);
                             connected_for_dispatch.store(false, Ordering::SeqCst);
                             break;
                         }
@@ -546,12 +602,19 @@ impl AuthSocketClient {
         }
 
         // Wait for the server's signed authenticationSuccess.
-        tokio::time::timeout(AUTH_SUCCESS_TIMEOUT, auth_success_rx)
-            .await
-            .map_err(|_| {
-                ClientError::Handshake("authenticationSuccess not received within 5s".into())
-            })?
-            .map_err(|_| ClientError::Handshake("auth success channel dropped".into()))?;
+        match tokio::time::timeout(AUTH_SUCCESS_TIMEOUT, auth_success_rx).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                abandon(client, connected, dead).await;
+                return Err(ClientError::Handshake("auth success channel dropped".into()));
+            }
+            Err(_) => {
+                abandon(client, connected, dead).await;
+                return Err(ClientError::Handshake(
+                    "authenticationSuccess not received within 5s".into(),
+                ));
+            }
+        }
 
         Ok(Self {
             client,
@@ -560,14 +623,18 @@ impl AuthSocketClient {
             fallback,
             joined_rooms,
             connected,
+            dead,
             last_inbound_ms,
             server_identity_key,
         })
     }
 
-    /// True if the connection is currently authenticated and live.
+    /// True if the connection is currently authenticated and live. Once any
+    /// component latches the death flag (watchdog, Close event, failed emit,
+    /// `disconnect()`), this is false FOREVER — a client is single-flight; the
+    /// consumer reconnects by building a fresh one.
     pub fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::SeqCst)
+        self.connected.load(Ordering::SeqCst) && !self.dead.load(Ordering::SeqCst)
     }
 
     /// Milliseconds since the last inbound frame of any kind (the watchdog's
@@ -613,8 +680,9 @@ impl AuthSocketClient {
             .await
             .map_err(ClientError::WebSocket)?;
         if let Err(e) = emit_auth_message(&self.client, &signed).await {
-            // A failed emit means the socket is dead — flip connected so
+            // A failed emit means the socket is dead — latch it so
             // is_connected() reflects reality and the supervisor reconnects.
+            self.dead.store(true, Ordering::SeqCst);
             self.connected.store(false, Ordering::SeqCst);
             return Err(ClientError::WebSocket(e));
         }
@@ -642,8 +710,10 @@ impl AuthSocketClient {
         self.emit("leaveRoom", &json!(room_id)).await
     }
 
-    /// Disconnect and clear all handlers/state.
+    /// Disconnect and clear all handlers/state (terminal — the death latch is
+    /// set; this client can never report connected again).
     pub async fn disconnect(&self) -> Result<(), ClientError> {
+        self.dead.store(true, Ordering::SeqCst);
         self.connected.store(false, Ordering::SeqCst);
         self.handlers.lock().await.clear();
         *self.fallback.lock().await = None;
