@@ -199,24 +199,34 @@ async fn keepalive_reasserts_lost_room_membership() {
     // Wait for the join to register server-side.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while core.room_members(&room).is_empty() {
-        assert!(std::time::Instant::now() < deadline, "join never registered");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "join never registered"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     let sid = core.room_members(&room)[0].clone();
 
     // Server-side membership loss (the skew a deploy can produce).
     core.leave_room(&sid, &room);
-    assert!(core.room_members(&room).is_empty(), "membership force-dropped");
+    assert!(
+        core.room_members(&room).is_empty(),
+        "membership force-dropped"
+    );
 
-    // The next keepalive probe (≤2s + processing) must re-assert it.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+    // The next keepalive probe must re-assert it. The bound is DERIVED from the
+    // cadence (two intervals plus slack for processing), never a magic number:
+    // a hardcoded one silently becomes either flaky or vacuous the moment
+    // KEEPALIVE_INTERVAL changes, which is exactly what it did.
+    let heal_bound = authsocket::KEEPALIVE_INTERVAL * 2 + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + heal_bound;
     loop {
         if core.room_members(&room).contains(&sid) {
             break; // healed
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "keepalive did not re-assert room membership within 6s"
+            "keepalive did not re-assert room membership within {heal_bound:?}"
         );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }

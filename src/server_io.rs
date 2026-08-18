@@ -146,6 +146,25 @@ pub fn attach<W, F, D>(
 }
 
 /// Route one verified event: generic room verbs here, the rest to the consumer.
+/// The own-room rule: a socket may only ever be placed in `{identityKey}` or
+/// `{identityKey}-{messageBox}`.
+///
+/// Anchored on the `-` delimiter rather than a bare prefix test. A bare
+/// `room_id.starts_with(identity)` authorizes any room whose id merely BEGINS
+/// with the key — `{key}evil` passes — which is not the invariant the rest of
+/// the stack relies on when it decides that a room's name proves its owner.
+/// 66-hex compressed keys cannot prefix one another today, so this is defence
+/// in depth rather than a live hole; it is written this way because both
+/// downstream forks already deviate from upstream to enforce it, and a rule
+/// every consumer has to re-harden belongs in the crate.
+///
+/// Used by BOTH the `joinRoom` verb and the keepalive presence re-assert, so
+/// the two can never drift: a keepalive must never be able to place a socket
+/// somewhere `joinRoom` would have refused it.
+fn owns_room(identity: &str, room_id: &str) -> bool {
+    !identity.is_empty() && (room_id == identity || room_id.starts_with(&format!("{identity}-")))
+}
+
 async fn handle_verified_event<W>(
     io: &SocketIo,
     server: &AuthSocketServer<W>,
@@ -173,7 +192,7 @@ async fn handle_verified_event<W>(
                     if room_id.is_empty() {
                         continue;
                     }
-                    if identity.is_empty() || !room_id.starts_with(&identity) {
+                    if !owns_room(&identity, room_id) {
                         warn!(sid = %sid, room = %room_id,
                             "authsocket: keepalive room re-assert rejected — identity mismatch");
                         continue;
@@ -200,10 +219,10 @@ async fn handle_verified_event<W>(
             // Fail closed: no verified identity -> no join. (`ev.sender` is that
             // identity, but read it back from the server so the check can never
             // drift from what emit_to_room will trust.)
-            let owns_room = server
+            let admitted = server
                 .identity_key(sid)
-                .is_some_and(|key| room_id.starts_with(&key));
-            if !owns_room {
+                .is_some_and(|key| owns_room(&key, &room_id));
+            if !admitted {
                 warn!(sid = %sid, room = %room_id,
                     "authsocket: joinRoom rejected — identity mismatch");
                 return;
@@ -330,4 +349,45 @@ where
     }
     debug!(room = %room_id, event = %event_name, delivered, "authsocket: signed broadcast to room");
     delivered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::owns_room;
+
+    /// A key is 66-hex, so no real key can prefix another — but the rule must
+    /// not DEPEND on that. A bare `starts_with` would admit `{key}evil`, and
+    /// every downstream fork already re-hardened this by hand rather than
+    /// inherit it. Pinned so it cannot regress back into the crate.
+    #[test]
+    fn own_room_is_anchored_on_the_delimiter_not_a_bare_prefix() {
+        let key = "02aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+
+        // The two legitimate shapes.
+        assert!(owns_room(key, key), "the bare identity room is your own");
+        assert!(
+            owns_room(key, &format!("{key}-mpc_inbox")),
+            "{{key}}-{{messageBox}} is your own"
+        );
+
+        // The bare-prefix hole this rule exists to close.
+        assert!(
+            !owns_room(key, &format!("{key}evil")),
+            "a room merely BEGINNING with the key is not your own"
+        );
+        assert!(
+            !owns_room(key, &format!("{key}0-inbox")),
+            "an extra character before the delimiter is not your own"
+        );
+
+        // Someone else's rooms.
+        assert!(!owns_room(key, "03deadbeef-inbox"));
+        assert!(!owns_room(key, "-mpc_inbox"));
+
+        // Fail closed with no verified identity: an empty key must never own
+        // anything, or an unauthenticated socket would own every room whose id
+        // starts with the empty string — which is all of them.
+        assert!(!owns_room("", "anything"));
+        assert!(!owns_room("", ""));
+    }
 }

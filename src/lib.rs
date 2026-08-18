@@ -43,6 +43,14 @@ pub mod transport;
 pub mod wire;
 
 pub use peer_session::{PeerHandle, VerifiedEvent};
+
+/// The client's liveness cadence, exposed so a consumer can size its own
+/// timeouts from the real value instead of a magic number that silently rots
+/// when the cadence changes. `KEEPALIVE_INTERVAL` is how often an idle client
+/// proves it is alive; `READ_DEADLINE` is how long a peer may be silent before
+/// the watchdog declares it dead.
+#[cfg(feature = "client")]
+pub use client::{KEEPALIVE_INTERVAL, READ_DEADLINE};
 pub use wire::{room_id, split_room_id, AUTH_MESSAGE_EVENT};
 
 #[cfg(feature = "server")]

@@ -53,17 +53,39 @@ use crate::wire::{decode_event, encode_event, AUTH_MESSAGE_EVENT};
 /// the watchdog would false-fire and force a reconnect storm. rust_socketio
 /// 0.6 exposes no engine.io pong callback, so this application-level
 /// round-trip is the only liveness signal available.
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
+///
+/// # Why 10s, and why this is a hub-scaling constant
+///
+/// The keepalive is NOT the dead-peer detector: `Event::Close`, a failed emit,
+/// and the read-deadline watchdog are. Its only job is to generate inbound
+/// traffic while a connection is idle, so the watchdog can tell "quiet" apart
+/// from "dead" — which matters solely for the HALF-OPEN case, where a peer
+/// vanishes without a FIN. A clean close is caught instantly without it.
+///
+/// Every probe is a SIGNED message the server must verify, so an idle fleet
+/// costs the hub roughly `N / KEEPALIVE_INTERVAL` signature verifications per
+/// second with nothing else happening. At the original 2s that is ~500/s per
+/// thousand idle connections — pure overhead on the one component every vault
+/// shares. 10s cuts that 5x while keeping half-open detection (30s, below) far
+/// inside the ceremony round deadlines that actually depend on it.
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Inbound read deadline for half-open detection. If NO frame of any kind
 /// arrives within this window, the socket is declared dead (`is_connected()`
 /// flips false) so the consumer's supervisor can reconnect. ~3x the keepalive
 /// cycle: tolerates transient jitter without false-firing, still detects a
-/// black-holed peer within ~6-7 s.
-const READ_DEADLINE: Duration = Duration::from_secs(6);
+/// black-holed peer within ~30-32 s.
+///
+/// This and [`KEEPALIVE_INTERVAL`] move TOGETHER — the invariants asserted in
+/// this module's tests tie them, and a client whose keepalive outruns a
+/// server's tolerance disconnects in a loop with no error anywhere. The pair is
+/// a graph-wide auth-boundary property (TR-011): change it in one release and
+/// bump every consumer together.
+pub const READ_DEADLINE: Duration = Duration::from_secs(30);
 
-/// How often the watchdog checks the inbound read deadline.
-const WATCHDOG_TICK: Duration = Duration::from_secs(1);
+/// How often the watchdog checks the inbound read deadline. Scaled with the
+/// pair above: a tick far below the deadline only burns wakeups.
+const WATCHDOG_TICK: Duration = Duration::from_secs(2);
 
 /// Maximum time to wait for the Socket.IO namespace connect-ack ("40{sid}")
 /// before failing the connection.
@@ -606,7 +628,9 @@ impl AuthSocketClient {
             Ok(Ok(())) => {}
             Ok(Err(_)) => {
                 abandon(client, connected, dead).await;
-                return Err(ClientError::Handshake("auth success channel dropped".into()));
+                return Err(ClientError::Handshake(
+                    "auth success channel dropped".into(),
+                ));
             }
             Err(_) => {
                 abandon(client, connected, dead).await;
@@ -740,8 +764,13 @@ mod tests {
             "deadline must tolerate at least one missed keepalive round-trip"
         );
         assert!(
-            READ_DEADLINE <= Duration::from_secs(8),
-            "half-open detection target is <~8s"
+            READ_DEADLINE <= Duration::from_secs(60),
+            "half-open detection must stay well inside the ceremony round deadlines \
+             that depend on it (600s), with room to spare"
+        );
+        assert!(
+            WATCHDOG_TICK < KEEPALIVE_INTERVAL,
+            "the watchdog must sample faster than the signal it watches"
         );
     }
 
