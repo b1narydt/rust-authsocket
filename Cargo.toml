@@ -1,6 +1,6 @@
 [package]
 name = "authsocket"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "BRC-103 mutually-authenticated Socket.IO for Rust — a faithful port of the TS @bsv authsocket / authsocket-client, sharing one wire contract across a socketioxide server and a rust_socketio client. Every application event (incl. room broadcasts) is signed and verified through a bsv-sdk BRC-103 Peer."
 license = "MIT OR Apache-2.0"
