@@ -13,6 +13,11 @@
 //! - the background receive loop (drives `Peer::process_next`), the
 //!   general-message dispatcher (verified events → `on(event)` handlers or the
 //!   fallback), the keepalive probe and the read-deadline watchdog.
+//! - PROMPT DEATH DETECTION: the Socket.IO `error` callback wakes the keepalive
+//!   for an immediate probe emit, so `is_connected()` tells the truth within
+//!   milliseconds of a peer that vanished without a protocol goodbye (SIGKILL,
+//!   container restart, TCP reset) — see the `Event::Error` handler in
+//!   [`AuthSocketClient::connect`].
 //! - [`AuthSocketClient::emit`] / [`AuthSocketClient::join_room`] /
 //!   [`AuthSocketClient::leave_room`] — every outbound event is signed as a
 //!   BRC-103 general message; there are no raw application events.
@@ -31,7 +36,7 @@ use futures_util::FutureExt;
 use rust_socketio::asynchronous::{Client as SocketClient, ClientBuilder};
 use rust_socketio::{Event, Payload, TransportType};
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 
 use async_trait::async_trait;
 use bsv::auth::error::AuthError;
@@ -255,8 +260,9 @@ pub struct AuthSocketClient {
     connected: Arc<AtomicBool>,
     /// DEATH LATCH — set (never cleared) the moment any component declares the
     /// socket dead: watchdog read-deadline expiry, Close lifecycle event, a
-    /// failed emit, keepalive failure, dispatcher channel close, or an explicit
-    /// `disconnect()`. `is_connected()` requires `!dead`, so a late
+    /// failed emit, keepalive failure (including the out-of-band probe the
+    /// Socket.IO `error` callback triggers), dispatcher channel close, or an
+    /// explicit `disconnect()`. `is_connected()` requires `!dead`, so a late
     /// `authenticationSuccess` (e.g. a draining server flushing stale keepalive
     /// replies) can re-store `connected` but can NEVER resurrect a client whose
     /// watchdog/keepalive tasks have already exited — that resurrection left a
@@ -267,6 +273,9 @@ pub struct AuthSocketClient {
     /// Monotonic millis of the last inbound frame of ANY kind (watchdog
     /// half-open detection).
     last_inbound_ms: Arc<AtomicU64>,
+    /// Kept alive for the lifetime of the client so the Socket.IO `error`
+    /// callback and the keepalive task keep sharing one waker.
+    _transport_error: Arc<Notify>,
     /// The server's identity key captured during the BRC-103 handshake.
     server_identity_key: String,
 }
@@ -300,9 +309,15 @@ impl AuthSocketClient {
         let auth_success_shared: Arc<Mutex<Option<oneshot::Sender<()>>>> =
             Arc::new(Mutex::new(Some(auth_success_tx)));
 
+        // Raised by the Socket.IO `error` callback; consumed by the keepalive
+        // task, which answers it with an IMMEDIATE probe emit. See
+        // [`AuthSocketClient`]'s "prompt death detection" note.
+        let transport_error: Arc<Notify> = Arc::new(Notify::new());
+
         let conn_clone = connected.clone();
         let conn_close_clone = connected.clone();
         let dead_close_clone = dead.clone();
+        let transport_error_cb = transport_error.clone();
 
         // Socket.IO connect-ack gate. `rust_socketio::connect()` sends the
         // namespace CONNECT packet ("40") and returns immediately, without
@@ -362,6 +377,28 @@ impl AuthSocketClient {
                 async move {
                     dead.store(true, Ordering::SeqCst);
                     conn.store(false, Ordering::SeqCst);
+                }
+                .boxed()
+            })
+            // Error: rust_socketio surfaces EVERY transport failure here, and
+            // it is the ONLY prompt death signal the stack gives us —
+            // `Event::Close` fires solely on a graceful Socket.IO `disconnect`
+            // packet, which a SIGKILLed/restarted/reset peer never sends, and
+            // `.reconnect(false)` makes the poller task exit in silence once
+            // its stream ends. Measured: this callback runs within a
+            // millisecond of the peer vanishing.
+            //
+            // It is NOT self-evidently terminal, though: rust_socketio also
+            // routes a malformed inbound application frame here without
+            // killing the socket. So this is a TRIGGER TO RE-VERIFY, not a
+            // verdict — it wakes the keepalive, which emits a probe NOW. A
+            // dead transport fails that write and latches death; a live one
+            // sails through and nothing changes. Liveness is therefore always
+            // decided by an actual write to the socket, never by a flag.
+            .on(Event::Error, move |_payload, _socket| {
+                let wake = transport_error_cb.clone();
+                async move {
+                    wake.notify_one();
                 }
                 .boxed()
             })
@@ -500,12 +537,20 @@ impl AuthSocketClient {
             let connected_for_keepalive = connected.clone();
             let dead_for_keepalive = dead.clone();
             let rooms_for_keepalive = joined_rooms.clone();
+            let transport_error_keepalive = transport_error.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(KEEPALIVE_INTERVAL);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 interval.tick().await; // skip the immediate first tick
                 loop {
-                    interval.tick().await;
+                    // Either the cadence came round, or the transport reported
+                    // an error and we owe the caller an immediate verdict.
+                    // `Notify::notified()` coalesces, so an error storm costs
+                    // one probe, not one per error.
+                    tokio::select! {
+                        _ = interval.tick() => {}
+                        _ = transport_error_keepalive.notified() => {}
+                    }
                     if dead_for_keepalive.load(Ordering::SeqCst) {
                         break; // socket declared dead — stop pinging
                     }
@@ -649,6 +694,7 @@ impl AuthSocketClient {
             connected,
             dead,
             last_inbound_ms,
+            _transport_error: transport_error,
             server_identity_key,
         })
     }
@@ -657,6 +703,16 @@ impl AuthSocketClient {
     /// component latches the death flag (watchdog, Close event, failed emit,
     /// `disconnect()`), this is false FOREVER — a client is single-flight; the
     /// consumer reconnects by building a fresh one.
+    ///
+    /// CONSUMER CONTRACT: a `true` here means "the last write to this socket
+    /// succeeded and nothing since has said otherwise". Supervisors read it as
+    /// "an emit will reach the hub", so every path that can learn the socket is
+    /// gone must latch death BEFORE the next caller reads this — that is why
+    /// the Socket.IO `error` callback forces an out-of-band probe rather than
+    /// leaving the verdict to the next 10s keepalive tick. Note that a socket
+    /// can still die in the window between this returning `true` and the
+    /// caller's emit landing; callers must treat a send error as retryable,
+    /// not as a violation of this contract.
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::SeqCst) && !self.dead.load(Ordering::SeqCst)
     }
