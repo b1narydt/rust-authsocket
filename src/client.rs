@@ -305,6 +305,16 @@ async fn emit_auth_message(client: &SocketClient, message: &AuthMessage) -> Resu
 /// message carried on the single `authMessage` Socket.IO event. Verified
 /// inbound events are dispatched to [`AuthSocketClient::on`] handlers (exact
 /// event-name match) or the [`AuthSocketClient::set_fallback`] handler.
+///
+/// This high-level client has no API for observing certificates sent by the
+/// server. The SDK can verify an inbound `certificateResponse` while advancing
+/// the protocol, but `AuthSocketClient` drops the certificate receiver and the
+/// delivered batch is discarded. The `connect_with_certificates` and
+/// `connect_with_certificate_provider` families supply this client's
+/// certificates to a requesting server; they do not expose server
+/// certificates. Consumers that need the latter must drive a
+/// [`Peer`](bsv::auth::peer::Peer) with [`SocketIOTransport`] directly and keep
+/// its `on_certificates` receiver.
 pub struct AuthSocketClient {
     /// Socket.IO client handle. `Client` is `Clone` (an `Arc` over the
     /// connection) and every emit takes `&self` — concurrent emits are safe.
@@ -612,8 +622,9 @@ impl AuthSocketClient {
         let peer = Arc::new(Peer::new(wallet, Arc::new(transport)));
 
         // Take and drop the SDK's bounded verified-certificate receiver. This
-        // client consumes server certificates only as protocol input; leaving
-        // the receiver alive but unread would block process_next on response 33.
+        // high-level client has no inbound-certificate observer, so verified
+        // server batches are deliberately discarded; leaving the receiver
+        // alive but unread would block process_next on response 33.
         drop(
             peer.on_certificates()
                 .expect("on_certificates take-once: fresh Peer"),
