@@ -1,6 +1,6 @@
 [package]
 name = "authsocket"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "BRC-103 mutually-authenticated Socket.IO for Rust — a faithful port of the TS @bsv authsocket / authsocket-client, sharing one wire contract across a socketioxide server and a rust_socketio client. Every application event (incl. room broadcasts) is signed and verified through a bsv-sdk BRC-103 Peer."
 license = "MIT OR Apache-2.0"
@@ -24,7 +24,7 @@ client = ["dep:rust_socketio"]
 # git-pinned copy here would split the graph into two bsv-sdk packages whose
 # WalletInterface/Peer types don't unify. ^0.3.1 resolves to the same single
 # crates.io copy consumers use.
-bsv-sdk = { version = "0.7.0", features = ["network"] }
+bsv-sdk = { version = "0.7.1", features = ["network"] }
 
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 async-trait = "0.1"
