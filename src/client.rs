@@ -96,6 +96,11 @@ const WATCHDOG_TICK: Duration = Duration::from_secs(2);
 /// before failing the connection.
 const CONNECT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Legacy servers complete authentication promptly because no certificate
+/// authorization decision is involved. Preserve the pre-certificate failure
+/// budget until an inbound handshake frame actually requests certificates.
+const LEGACY_AUTHENTICATION_SUCCESS_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Default maximum time to wait for the server's signed
 /// `authenticationSuccess` after the BRC-103 handshake.
 ///
@@ -103,6 +108,17 @@ const CONNECT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// [`AuthSocketClientOptions::set_authentication_success_timeout`] when the
 /// server is configured with a different budget.
 pub const AUTHENTICATION_SUCCESS_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn authentication_success_wait_budget(
+    certificate_requested: bool,
+    configured_timeout: Duration,
+) -> Duration {
+    if certificate_requested {
+        configured_timeout
+    } else {
+        configured_timeout.min(LEGACY_AUTHENTICATION_SUCCESS_TIMEOUT)
+    }
+}
 
 /// Connection-time settings for [`AuthSocketClient`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -595,6 +611,14 @@ impl AuthSocketClient {
         let transport = SocketIOTransport::new(client.clone(), auth_msg_rx);
         let peer = Arc::new(Peer::new(wallet, Arc::new(transport)));
 
+        // Take and drop the SDK's bounded verified-certificate receiver. This
+        // client consumes server certificates only as protocol input; leaving
+        // the receiver alive but unread would block process_next on response 33.
+        drop(
+            peer.on_certificates()
+                .expect("on_certificates take-once: fresh Peer"),
+        );
+
         // Provider mode takes control of the SDK callback before the handshake.
         // The callback itself is synchronous, so async certificate retrieval and
         // response sending run in a task and report completion through this
@@ -922,8 +946,15 @@ impl AuthSocketClient {
             });
         }
 
-        // Wait for the server's signed authenticationSuccess.
-        match tokio::time::timeout(options.authentication_success_timeout, auth_success_rx).await {
+        // A legacy server gets the original short failure budget. A server
+        // that requested certificates gets the configured authorization-sized
+        // budget; the Socket.IO callback sets the flag before the handshake
+        // frame reaches the Peer, so it is observable by this point.
+        let authentication_success_timeout = authentication_success_wait_budget(
+            certificate_requested.load(Ordering::SeqCst),
+            options.authentication_success_timeout,
+        );
+        match tokio::time::timeout(authentication_success_timeout, auth_success_rx).await {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(reason))) => {
                 abandon(client, connected, dead).await;
@@ -955,17 +986,17 @@ impl AuthSocketClient {
                 {
                     format!(
                         "authenticationSuccess not received within {}s after the server requested certificates; configure connect_with_certificates or connect_with_certificate_provider and ensure the server accepts the batch",
-                        options.authentication_success_timeout.as_secs_f64()
+                        authentication_success_timeout.as_secs_f64()
                     )
                 } else if certificate_requested.load(Ordering::SeqCst) {
                     format!(
                         "authenticationSuccess not received within {}s after the certificate response was sent; align AuthSocketClientOptions with the server's certificate-authorization timeout",
-                        options.authentication_success_timeout.as_secs_f64()
+                        authentication_success_timeout.as_secs_f64()
                     )
                 } else {
                     format!(
                         "authenticationSuccess not received within {}s",
-                        options.authentication_success_timeout.as_secs_f64()
+                        authentication_success_timeout.as_secs_f64()
                     )
                 };
                 return Err(ClientError::Handshake(message));
@@ -1128,6 +1159,21 @@ mod tests {
         assert_eq!(
             options.authentication_success_timeout(),
             Duration::from_secs(45)
+        );
+        assert_eq!(
+            authentication_success_wait_budget(false, AUTHENTICATION_SUCCESS_TIMEOUT),
+            Duration::from_secs(5),
+            "legacy servers retain the pre-certificate failure latency"
+        );
+        assert_eq!(
+            authentication_success_wait_budget(true, AUTHENTICATION_SUCCESS_TIMEOUT),
+            Duration::from_secs(30),
+            "a certificate request extends the wait to the authorization budget"
+        );
+        assert_eq!(
+            authentication_success_wait_budget(false, Duration::from_secs(3)),
+            Duration::from_secs(3),
+            "an explicitly shorter consumer timeout still wins"
         );
     }
 

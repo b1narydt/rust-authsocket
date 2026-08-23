@@ -21,7 +21,7 @@ use authsocket::server::{
     AuthSocketServer, CertificateAuthorizationDecision, SharedAuthSocketServer,
 };
 use authsocket::server_io::{
-    attach, emit_signed_to_room, send_certificate_response, AppDispatcher,
+    attach, emit_signed_to_room, emit_signed_to_socket, send_certificate_response, AppDispatcher,
 };
 use authsocket::{wire::decode_event, wire::encode_event, AUTH_MESSAGE_EVENT};
 
@@ -72,10 +72,35 @@ impl AppDispatcher<ProtoWallet> for TestDispatcher {
         &self,
         io: &SocketIo,
         server: &AuthSocketServer<ProtoWallet>,
-        _socket: &SocketRef,
+        socket: &SocketRef,
         event: VerifiedEvent,
     ) {
         let _ = self.seen.send(event.clone());
+        if event.event_name == "certificateFlood" {
+            let server_identity = identity_of(SERVER_KEY).await;
+            let certificate = membership_certificate(&server_identity, CERTIFIER_KEY).await;
+            let sid = socket.id.to_string();
+            for _ in 0..33 {
+                if !send_certificate_response(
+                    io,
+                    server,
+                    &sid,
+                    &event.sender,
+                    vec![certificate.clone()],
+                )
+                .await
+                {
+                    return;
+                }
+            }
+            emit_signed_to_socket(
+                socket,
+                server,
+                "afterCertificateFlood",
+                &json!({ "processed": 33 }),
+            )
+            .await;
+        }
         if event.event_name == "appPing" {
             if let Some(room) = event.data.get("room").and_then(Value::as_str) {
                 emit_signed_to_room(io, server, room, "appPong", &event.data).await;
@@ -519,6 +544,37 @@ async fn authsocket_client_completes_with_slow_accepting_certificate_authorizer(
     .expect("crate client must complete certificate-gated authentication");
     assert!(client.is_connected());
     assert!(authorizer_called.load(Ordering::SeqCst));
+    client.disconnect().await.expect("disconnect");
+}
+
+#[tokio::test]
+async fn authsocket_client_does_not_wedge_on_33rd_certificate_response() {
+    let (url, _core, _dispatched) = boot_server().await;
+    let client_identity = identity_of(CLIENT_KEY).await;
+    let wallet = ProtoWallet::new(PrivateKey::from_hex(CLIENT_KEY).expect("client key"));
+    let client = AuthSocketClient::connect(&url, &client_identity, wallet)
+        .await
+        .expect("connect + handshake");
+    let (processed_tx, mut processed_rx) = mpsc::unbounded_channel();
+    client
+        .on(
+            "afterCertificateFlood",
+            Arc::new(move |data| {
+                let _ = processed_tx.send(data);
+            }),
+        )
+        .await;
+
+    client
+        .emit("certificateFlood", &json!({}))
+        .await
+        .expect("request server certificate responses");
+    let processed = tokio::time::timeout(std::time::Duration::from_secs(10), processed_rx.recv())
+        .await
+        .expect("client wedged on or before certificateResponse 33")
+        .expect("processed event channel");
+    assert_eq!(processed, json!({ "processed": 33 }));
+
     client.disconnect().await.expect("disconnect");
 }
 
