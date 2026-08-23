@@ -58,9 +58,14 @@ pub mod server;
 #[cfg(feature = "server")]
 pub mod server_io;
 #[cfg(feature = "server")]
-pub use server::{AuthSocketServer, SharedAuthSocketServer};
+pub use server::{
+    AuthSocketServer, CertificateAuthorization, CertificateAuthorizationDecision,
+    OnCertificatesRequested, SharedAuthSocketServer,
+};
 #[cfg(feature = "server")]
-pub use server_io::{attach, emit_signed_to_room, emit_signed_to_socket, AppDispatcher};
+pub use server_io::{
+    attach, emit_signed_to_room, emit_signed_to_socket, send_certificate_response, AppDispatcher,
+};
 
 #[cfg(feature = "client")]
 pub mod client;

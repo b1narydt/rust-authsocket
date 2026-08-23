@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use bsv::auth::types::AuthMessage;
-use bsv::wallet::interfaces::WalletInterface;
+use bsv::wallet::interfaces::{Certificate, WalletInterface};
 use serde_json::Value;
 use socketioxide::extract::{Data, SocketRef};
 use socketioxide::SocketIo;
@@ -53,7 +53,11 @@ pub trait AppDispatcher<W: WalletInterface + 'static>: Send + Sync {
 ///
 /// `wallet_factory` builds the per-connection server wallet (e.g. a
 /// `ProtoWallet` over the server private key). `dispatcher` receives verified
-/// app events.
+/// app events. To require peer certificates, call
+/// [`AuthSocketServer::set_certificates_to_request`] and
+/// [`AuthSocketServer::set_certificate_authorizer`] on `server` before calling
+/// `attach`; this adapter then withholds `authenticationSuccess` until acceptance
+/// and disconnects immediately on rejection.
 pub fn attach<W, F, D>(
     io: &SocketIo,
     server: SharedAuthSocketServer<W>,
@@ -119,6 +123,19 @@ pub fn attach<W, F, D>(
                     // Handshake responses / signed replies back over this socket.
                     for msg in driven.outbound {
                         emit_frame(&socket, &sid, &msg);
+                    }
+
+                    // A certificate rejection is a terminal authorization
+                    // result, not an application event. Close before generic
+                    // `authenticated` handling can acknowledge the session.
+                    if let Some(authorization) = server.certificate_authorization(&sid) {
+                        if let Some(reason) = authorization.rejection_reason() {
+                            warn!(sid = %sid, reason = %reason,
+                                "authsocket: certificate authorization rejected — closing socket");
+                            server.remove_connection(&sid);
+                            socket.disconnect().ok();
+                            return;
+                        }
                     }
 
                     // Verified app events: generic room verbs in the adapter,
@@ -295,6 +312,50 @@ where
         return false;
     }
     msgs.iter().all(|m| emit_frame(socket, &sid, m))
+}
+
+/// Send a BRC-103 certificate response on `socket_id` and emit every signed
+/// frame through the socketioxide namespace.
+///
+/// This is the response half for callbacks registered with
+/// [`AuthSocketServer::listen_for_certificates_requested`]. It returns `false`
+/// if the connection/session is unavailable or any frame cannot be emitted.
+pub async fn send_certificate_response<W>(
+    io: &SocketIo,
+    server: &AuthSocketServer<W>,
+    socket_id: &str,
+    identity_key: &str,
+    certificates: Vec<Certificate>,
+) -> bool
+where
+    W: WalletInterface + Send + Sync + 'static,
+{
+    let messages = match server
+        .send_certificate_response(socket_id, identity_key, certificates)
+        .await
+    {
+        Ok(messages) => messages,
+        Err(error) => {
+            warn!(sid = %socket_id, error = %error,
+                "authsocket: certificate response signing failed");
+            return false;
+        }
+    };
+    let socket = match socket_id.parse() {
+        Ok(id) => io.of("/").and_then(|namespace| namespace.get_socket(id)),
+        Err(error) => {
+            warn!(sid = %socket_id, error = %error,
+                "authsocket: unparseable socket id for certificate response");
+            None
+        }
+    };
+    let Some(socket) = socket else {
+        return false;
+    };
+    !messages.is_empty()
+        && messages
+            .iter()
+            .all(|message| emit_frame(&socket, socket_id, message))
 }
 
 /// Sign an app event for every authenticated member of `room_id` and emit each
