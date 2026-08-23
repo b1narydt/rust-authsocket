@@ -298,7 +298,8 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
     pub fn certificate_authorization(&self, socket_id: &str) -> Option<CertificateAuthorization> {
         let conn = self.conn(socket_id)?;
         Self::expire_connection(&conn);
-        Some(conn.certificate_authorization.read().clone())
+        let authorization = conn.certificate_authorization.read().clone();
+        Some(authorization)
     }
 
     /// Transition an overdue `Pending` connection to terminal rejection.
