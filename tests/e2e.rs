@@ -5,20 +5,31 @@
 //! Requires `--features server,client`.
 #![cfg(all(feature = "server", feature = "client"))]
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use futures_util::FutureExt;
+use rust_socketio::{Event, TransportType};
 use serde_json::{json, Value};
 use socketioxide::extract::SocketRef;
 use socketioxide::SocketIo;
 use tokio::sync::mpsc;
 
-use authsocket::client::AuthSocketClient;
+use authsocket::client::{parse_auth_message_from_payload, AuthSocketClient, SocketIOTransport};
 use authsocket::peer_session::VerifiedEvent;
-use authsocket::server::{AuthSocketServer, SharedAuthSocketServer};
+use authsocket::server::{
+    AuthSocketServer, CertificateAuthorizationDecision, SharedAuthSocketServer,
+};
 use authsocket::server_io::{attach, emit_signed_to_room, AppDispatcher};
+use authsocket::{wire::encode_event, AUTH_MESSAGE_EVENT};
 
+use bsv::auth::peer::Peer;
+use bsv::auth::types::RequestedCertificateSet;
 use bsv::primitives::private_key::PrivateKey;
-use bsv::wallet::interfaces::{GetPublicKeyArgs, WalletInterface};
+use bsv::primitives::public_key::PublicKey;
+use bsv::wallet::interfaces::{
+    Certificate, CertificateType, GetPublicKeyArgs, SerialNumber, WalletInterface,
+};
 use bsv::wallet::proto_wallet::ProtoWallet;
 
 const SERVER_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000011";
@@ -76,8 +87,18 @@ async fn boot_server() -> (
     SharedAuthSocketServer<ProtoWallet>,
     mpsc::UnboundedReceiver<VerifiedEvent>,
 ) {
-    let (layer, io) = SocketIo::new_layer();
     let core: SharedAuthSocketServer<ProtoWallet> = Arc::new(AuthSocketServer::new());
+    boot_server_with_core(core).await
+}
+
+async fn boot_server_with_core(
+    core: SharedAuthSocketServer<ProtoWallet>,
+) -> (
+    String,
+    SharedAuthSocketServer<ProtoWallet>,
+    mpsc::UnboundedReceiver<VerifiedEvent>,
+) {
+    let (layer, io) = SocketIo::new_layer();
     let (seen_tx, seen_rx) = mpsc::unbounded_channel();
 
     attach(
@@ -101,6 +122,129 @@ async fn boot_server() -> (
     });
 
     (format!("http://{addr}"), core, seen_rx)
+}
+
+fn membership_request(certifier: String) -> RequestedCertificateSet {
+    let mut requested = RequestedCertificateSet {
+        certifiers: vec![certifier],
+        ..RequestedCertificateSet::default()
+    };
+    requested.insert(
+        "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=".to_string(),
+        vec!["membership".to_string()],
+    );
+    requested
+}
+
+fn membership_certificate(subject: &str, certifier: &str) -> Certificate {
+    Certificate {
+        cert_type: CertificateType([7; 32]),
+        serial_number: SerialNumber([9; 32]),
+        subject: PublicKey::from_string(subject).expect("subject key"),
+        certifier: PublicKey::from_string(certifier).expect("certifier key"),
+        revocation_outpoint: Some("00".repeat(32)),
+        fields: None,
+        signature: Some(vec![1, 2, 3]),
+    }
+}
+
+#[tokio::test]
+async fn rejected_certificate_closes_socket_before_authentication_success() {
+    let server_identity = identity_of(SERVER_KEY).await;
+    let client_identity = identity_of(CLIENT_KEY).await;
+    let core: SharedAuthSocketServer<ProtoWallet> = Arc::new(AuthSocketServer::new());
+    core.set_certificates_to_request(membership_request(server_identity.clone()));
+    let authorizer_called = Arc::new(AtomicBool::new(false));
+    let authorizer_called_cb = authorizer_called.clone();
+    core.set_certificate_authorizer(move |_, _| {
+        let called = authorizer_called_cb.clone();
+        async move {
+            called.store(true, Ordering::SeqCst);
+            CertificateAuthorizationDecision::Reject("membership denied".into())
+        }
+    });
+    let (url, _core, mut dispatched) = boot_server_with_core(core).await;
+
+    let (auth_tx, auth_rx) = mpsc::channel(64);
+    let auth_tx_cb = auth_tx.clone();
+    let (ready_tx, mut ready_rx) = mpsc::channel(1);
+    let closed = Arc::new(AtomicBool::new(false));
+    let closed_cb = closed.clone();
+    let socket = rust_socketio::asynchronous::ClientBuilder::new(&url)
+        .on(AUTH_MESSAGE_EVENT, move |payload, _| {
+            let tx = auth_tx_cb.clone();
+            async move {
+                if let Some(message) = parse_auth_message_from_payload(&payload) {
+                    let _ = tx.send(message).await;
+                }
+            }
+            .boxed()
+        })
+        .on(Event::Connect, move |_, _| {
+            let tx = ready_tx.clone();
+            async move {
+                let _ = tx.try_send(());
+            }
+            .boxed()
+        })
+        .on(Event::Close, move |_, _| {
+            let closed = closed_cb.clone();
+            async move {
+                closed.store(true, Ordering::SeqCst);
+            }
+            .boxed()
+        })
+        .transport_type(TransportType::Websocket)
+        .reconnect(false)
+        .connect()
+        .await
+        .expect("raw Socket.IO connect");
+    tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx.recv())
+        .await
+        .expect("namespace connect ack")
+        .expect("connect channel");
+
+    let peer = Arc::new(Peer::new(
+        ProtoWallet::new(PrivateKey::from_hex(CLIENT_KEY).expect("client key")),
+        Arc::new(SocketIOTransport::new(socket.clone(), auth_rx)),
+    ));
+    let peer_for_response = peer.clone();
+    let certificate = membership_certificate(&client_identity, &server_identity);
+    peer.listen_for_certificates_requested(Arc::new(move |verifier, _| {
+        let peer = peer_for_response.clone();
+        let certificate = certificate.clone();
+        tokio::spawn(async move {
+            let _ = peer
+                .send_certificate_response(&verifier, vec![certificate])
+                .await;
+        });
+    }));
+
+    // The general message may race the spawned certificate response, but the
+    // server gate suppresses it while Pending and closes as soon as Reject is
+    // returned. It must never reach the application dispatcher.
+    let _ = peer
+        .send_message(
+            "",
+            encode_event("authenticated", &json!({ "identityKey": client_identity })),
+        )
+        .await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !closed.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rejected certificate did not close the socket"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        authorizer_called.load(Ordering::SeqCst),
+        "certificate authorizer must run before close"
+    );
+    assert!(
+        dispatched.try_recv().is_err(),
+        "rejected connection must not dispatch an application event"
+    );
 }
 
 #[tokio::test]
