@@ -13,12 +13,11 @@
 //!
 //! [`Peer`]: bsv::auth::peer::Peer
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use bsv::auth::error::AuthError;
 use bsv::auth::transports::Transport;
-use bsv::auth::types::{AuthMessage, MessageType};
+use bsv::auth::types::AuthMessage;
 use tokio::sync::mpsc;
 
 /// Channel size for in-flight auth frames in each direction.
@@ -33,18 +32,6 @@ const CHANNEL_CAP: usize = 32;
 pub struct ChannelTransport {
     outgoing_tx: mpsc::Sender<AuthMessage>,
     incoming_rx: Mutex<Option<mpsc::Receiver<AuthMessage>>>,
-    block_initial_requests: AtomicBool,
-}
-
-/// RAII guard used by non-initiating server operations. If the guarded SDK
-/// call ever tries to fall back to a handshake, the transport rejects its
-/// `initialRequest`; cancellation and early returns restore normal behavior.
-pub(crate) struct InitialRequestBlock(Arc<ChannelTransport>);
-
-impl Drop for InitialRequestBlock {
-    fn drop(&mut self) {
-        self.0.block_initial_requests.store(false, Ordering::SeqCst);
-    }
 }
 
 impl ChannelTransport {
@@ -55,29 +42,14 @@ impl ChannelTransport {
         let transport = Self {
             outgoing_tx: out_tx,
             incoming_rx: Mutex::new(Some(in_rx)),
-            block_initial_requests: AtomicBool::new(false),
         };
         (transport, in_tx, out_rx)
-    }
-
-    /// Reject any SDK fallback that attempts to initiate a handshake until the
-    /// returned guard is dropped.
-    pub(crate) fn block_initial_requests(self: &Arc<Self>) -> InitialRequestBlock {
-        self.block_initial_requests.store(true, Ordering::SeqCst);
-        InitialRequestBlock(self.clone())
     }
 }
 
 #[async_trait::async_trait]
 impl Transport for ChannelTransport {
     async fn send(&self, message: AuthMessage) -> Result<(), AuthError> {
-        if message.message_type == MessageType::InitialRequest
-            && self.block_initial_requests.load(Ordering::SeqCst)
-        {
-            return Err(AuthError::NotAuthenticated(
-                "server certificate response requires an existing authenticated session".into(),
-            ));
-        }
         self.outgoing_tx
             .send(message)
             .await

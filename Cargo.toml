@@ -22,9 +22,11 @@ client = ["dep:rust_socketio"]
 # Plain crates.io dependency: the whole consumer graph (rust-mpc,
 # rust-messagebox-client) moved off git pins onto the published bsv-sdk, and a
 # git-pinned copy here would split the graph into two bsv-sdk packages whose
-# WalletInterface/Peer types don't unify. ^0.3.1 resolves to the same single
-# crates.io copy consumers use.
-bsv-sdk = { version = "0.7.1", features = ["network"] }
+# WalletInterface/Peer types don't unify. This exact pin is a security boundary:
+# authsocket depends on 0.7.1's certificateResponse nonce/session/signature,
+# replay, and certificate validation before Peer::on_certificates delivery.
+# Relaxing it could silently restore the pre-0.7 unverified dispatch behavior.
+bsv-sdk = { version = "=0.7.1", features = ["network"] }
 
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 async-trait = "0.1"

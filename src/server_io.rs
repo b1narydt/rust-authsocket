@@ -56,9 +56,12 @@ pub trait AppDispatcher<W: WalletInterface + 'static>: Send + Sync {
 /// app events. To require peer certificates, call
 /// [`AuthSocketServer::set_certificates_to_request`] and
 /// [`AuthSocketServer::set_certificate_authorizer`] on `server` before calling
-/// `attach`. The transport-agnostic core suppresses verified events (including
-/// `authenticated`) until acceptance; this adapter observes terminal rejection
-/// and disconnects the socket before any event can be dispatched.
+/// `attach` (along with any authorization-timeout override). These settings are
+/// snapshotted when this adapter adds each connection; changing them after
+/// `attach` can leave already-connected sockets on their original policy. The
+/// transport-agnostic core suppresses verified events (including `authenticated`)
+/// until acceptance; this adapter observes terminal rejection and disconnects
+/// the socket before any event can be dispatched.
 pub fn attach<W, F, D>(
     io: &SocketIo,
     server: SharedAuthSocketServer<W>,

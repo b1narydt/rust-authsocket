@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use bsv::auth::error::AuthError;
 use bsv::auth::peer::{OnCertificateRequestReceived, Peer};
-use bsv::auth::types::{AuthMessage, PeerSession, RequestedCertificateSet};
+use bsv::auth::types::{AuthMessage, RequestedCertificateSet};
 use bsv::wallet::interfaces::{Certificate, WalletInterface};
 use serde_json::Value;
 use tokio::sync::{mpsc, Mutex};
@@ -55,6 +55,15 @@ pub struct VerifiedEvent {
     pub data: Value,
 }
 
+type VerifiedCertificateBatch = (String, Vec<Certificate>);
+
+pub(crate) struct CertificateDrive {
+    pub outbound: Vec<AuthMessage>,
+    pub events: Vec<VerifiedEvent>,
+    pub certificates: Vec<VerifiedCertificateBatch>,
+    pub error: Option<AuthError>,
+}
+
 /// Owns a `Peer` and the channels bridging it to a Socket.IO connection.
 pub struct PeerHandle<W: WalletInterface + 'static> {
     /// The 0.3 `Peer` is fully `&self` (interior mutability), so no outer lock
@@ -67,28 +76,36 @@ pub struct PeerHandle<W: WalletInterface + 'static> {
     /// Decoded, verified BRC-103 general-message payloads with their verified
     /// sender key (app events).
     general_rx: Mutex<mpsc::Receiver<(String, Vec<u8>)>>,
-    /// Shared transport control used to make server-side certificate responses
-    /// strictly non-initiating.
-    transport: Arc<ChannelTransport>,
     /// Serializes certificate-aware driving with server-side certificate
     /// responses so neither operation can drain the other's outbound frames.
     certificate_io: Mutex<()>,
+    /// SDK-verified certificate batches. Taken only for certificate-gated
+    /// server peers; the exact default-off construction leaves it untouched.
+    certificate_rx: Option<Mutex<mpsc::Receiver<VerifiedCertificateBatch>>>,
 }
 
 impl<W: WalletInterface + 'static> PeerHandle<W> {
     /// Build a fresh session for one connection.
     pub fn new(wallet: W) -> Self {
-        Self::build(wallet, None)
+        Self::build(wallet, None, false)
     }
 
-    /// Internal server construction path. When `requested` is `None`, this is
-    /// the same construction path as [`PeerHandle::new`], including leaving the
-    /// SDK certificate receiver available through [`PeerHandle::peer`].
-    pub(crate) fn new_for_server(wallet: W, requested: Option<RequestedCertificateSet>) -> Self {
-        Self::build(wallet, requested)
+    /// Internal server construction path. When `receive_certificates` is
+    /// `false`, this leaves the SDK certificate receiver untouched exactly as
+    /// [`PeerHandle::new`] does.
+    pub(crate) fn new_for_server(
+        wallet: W,
+        requested: Option<RequestedCertificateSet>,
+        receive_certificates: bool,
+    ) -> Self {
+        Self::build(wallet, requested, receive_certificates)
     }
 
-    fn build(wallet: W, requested: Option<RequestedCertificateSet>) -> Self {
+    fn build(
+        wallet: W,
+        requested: Option<RequestedCertificateSet>,
+        receive_certificates: bool,
+    ) -> Self {
         let (transport, incoming_tx, outgoing_rx) = ChannelTransport::new();
         let transport = Arc::new(transport);
         let peer = Peer::new(wallet, transport.clone());
@@ -99,13 +116,19 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
         let general_rx = peer
             .on_general_message()
             .expect("on_general_message must succeed on a fresh Peer");
+        let certificate_rx = receive_certificates.then(|| {
+            Mutex::new(
+                peer.on_certificates()
+                    .expect("on_certificates must succeed on a fresh Peer"),
+            )
+        });
         Self {
             peer,
             incoming_tx,
             outgoing_rx: Mutex::new(outgoing_rx),
             general_rx: Mutex::new(general_rx),
-            transport,
             certificate_io: Mutex::new(()),
+            certificate_rx,
         }
     }
 
@@ -118,7 +141,7 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
     ///    messages. Each carries the **verified** sender key (see
     ///    [`VerifiedEvent`]); a frame that fails verification produces no event.
     pub async fn drive(&self, inbound: AuthMessage) -> (Vec<AuthMessage>, Vec<VerifiedEvent>) {
-        self.process_inbound(inbound).await;
+        let _ = self.process_inbound(inbound).await;
         (self.drain_outbound().await, self.drain_events().await)
     }
 
@@ -126,16 +149,18 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
     /// protocol behavior, but serializes outbound production/draining with
     /// [`PeerHandle::send_certificate_response_existing`]. The legacy server
     /// path does not call this method and therefore gains no additional await.
-    pub(crate) async fn drive_certificate_aware(
-        &self,
-        inbound: AuthMessage,
-    ) -> (Vec<AuthMessage>, Vec<VerifiedEvent>) {
+    pub(crate) async fn drive_certificate_aware(&self, inbound: AuthMessage) -> CertificateDrive {
         let _guard = self.certificate_io.lock().await;
-        self.process_inbound(inbound).await;
-        (self.drain_outbound().await, self.drain_events().await)
+        let error = self.process_inbound(inbound).await.err();
+        CertificateDrive {
+            outbound: self.drain_outbound().await,
+            events: self.drain_events().await,
+            certificates: self.drain_certificates().await,
+            error,
+        }
     }
 
-    async fn process_inbound(&self, inbound: AuthMessage) {
+    async fn process_inbound(&self, inbound: AuthMessage) -> Result<(), AuthError> {
         // Hand the frame to the Peer's transport input.
         let _ = self.incoming_tx.send(inbound).await;
 
@@ -143,9 +168,11 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
         // general messages onto general_rx and outbound frames onto outgoing_rx).
         // A failure means verification did not complete for some frame — the
         // Peer never pushes an unverified event, so we just log and drain.
-        if let Err(e) = self.peer.process_pending().await {
+        let result = self.peer.process_pending().await;
+        if let Err(e) = &result {
             tracing::warn!(error = %e, "authsocket: process_pending (frame not verified)");
         }
+        result.map(|_| ())
     }
 
     /// Sign an application event for an **already-authenticated** session and
@@ -191,25 +218,8 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
         &self.peer
     }
 
-    /// Resolve `session_nonce` without initiating a handshake, requiring the
-    /// exact socket-local session to be established and authenticated.
-    pub(crate) async fn authenticated_session_by_nonce(
-        &self,
-        session_nonce: &str,
-    ) -> Result<PeerSession, AuthError> {
-        self.peer
-            .session_by_identifier(session_nonce)
-            .await
-            .filter(|session| session.is_authenticated && session.session_nonce == session_nonce)
-            .ok_or_else(|| {
-                AuthError::SessionNotFound(format!(
-                    "authenticated session not found for nonce: {session_nonce}"
-                ))
-            })
-    }
-
     /// Register a handler for certificate requests received by this peer.
-    pub fn listen_for_certificates_requested(
+    pub(crate) fn listen_for_certificates_requested(
         &self,
         callback: Arc<OnCertificateRequestReceived>,
     ) -> u64 {
@@ -217,34 +227,30 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
     }
 
     /// Stop a certificate-request handler registered on this peer.
-    pub fn stop_listening_for_certificates_requested(&self, callback_id: u64) {
+    pub(crate) fn stop_listening_for_certificates_requested(&self, callback_id: u64) {
         self.peer
             .stop_listening_for_certificates_requested(callback_id);
     }
 
     /// Send certificates only when `identity_key` already resolves an
     /// authenticated session, and return exactly the frames produced by this
-    /// call. This method cannot initiate a handshake: it preflights the session
-    /// and blocks any SDK `initialRequest` fallback at the transport boundary.
+    /// call. This method cannot initiate a handshake: the TTL-honoring
+    /// `create_general_message` preflight fails before the SDK's potentially
+    /// initiating certificate-response API is called.
     pub(crate) async fn send_certificate_response_existing(
         &self,
         identity_key: &str,
         certificates: Vec<Certificate>,
     ) -> Result<Vec<AuthMessage>, AuthError> {
         let _guard = self.certificate_io.lock().await;
-        let session = self
-            .peer
-            .session_by_identifier(identity_key)
-            .await
-            .filter(|session| session.is_authenticated && session.peer_identity_key == identity_key)
-            .ok_or_else(|| {
-                AuthError::SessionNotFound(format!(
-                    "authenticated session not found for identity: {identity_key}"
-                ))
-            })?;
-        let _block = self.transport.block_initial_requests();
+        // Use the same active-session lookup as SDK verification/signing paths.
+        // The discarded message refreshes session activity and proves that the
+        // following SDK call cannot take its missing-session handshake fallback.
         self.peer
-            .send_certificate_response(&session.peer_identity_key, certificates)
+            .create_general_message(identity_key, Vec::new())
+            .await?;
+        self.peer
+            .send_certificate_response(identity_key, certificates)
             .await?;
         Ok(self.drain_outbound().await)
     }
@@ -278,5 +284,22 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
             }
         }
         events
+    }
+
+    async fn drain_certificates(&self) -> Vec<VerifiedCertificateBatch> {
+        let Some(rx) = &self.certificate_rx else {
+            return Vec::new();
+        };
+        let mut certificates = Vec::new();
+        let mut rx = rx.lock().await;
+        while let Ok(batch) = rx.try_recv() {
+            certificates.push(batch);
+        }
+        certificates
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn lock_certificate_io_for_test(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.certificate_io.lock().await
     }
 }
