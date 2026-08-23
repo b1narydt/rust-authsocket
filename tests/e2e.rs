@@ -11,7 +11,7 @@ use std::sync::Arc;
 use futures_util::FutureExt;
 use rust_socketio::{Event, TransportType};
 use serde_json::{json, Value};
-use socketioxide::extract::SocketRef;
+use socketioxide::extract::{Data, SocketRef};
 use socketioxide::SocketIo;
 use tokio::sync::mpsc;
 
@@ -153,6 +153,50 @@ async fn boot_server_with_core(
     (format!("http://{addr}"), core, seen_rx)
 }
 
+/// Complete BRC-103 framing but intentionally discard the verified
+/// `authenticated` event, modeling a legacy integration that never emits the
+/// signed `authenticationSuccess` acknowledgement.
+async fn boot_handshake_only_server() -> String {
+    let core: SharedAuthSocketServer<ProtoWallet> = Arc::new(AuthSocketServer::new());
+    let (layer, io) = SocketIo::new_layer();
+    io.ns("/", move |socket: SocketRef| {
+        let sid = socket.id.to_string();
+        core.add_connection(
+            &sid,
+            ProtoWallet::new(PrivateKey::from_hex(SERVER_KEY).expect("server key")),
+        );
+        let core = core.clone();
+        socket.on(
+            AUTH_MESSAGE_EVENT,
+            move |socket: SocketRef, Data(data): Data<Value>| {
+                let core = core.clone();
+                async move {
+                    let message: AuthMessage =
+                        serde_json::from_value(data).expect("valid test authMessage");
+                    let driven = core.on_auth_message(&socket.id.to_string(), message).await;
+                    for outbound in driven.outbound {
+                        let json = serde_json::to_value(outbound).expect("serialize authMessage");
+                        socket
+                            .emit(AUTH_MESSAGE_EVENT, &json)
+                            .expect("emit handshake response");
+                    }
+                    // Deliberately do not dispatch driven.events.
+                }
+            },
+        );
+    });
+
+    let app = axum::Router::new().layer(layer);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    format!("http://{addr}")
+}
+
 fn membership_request(certifier: String) -> RequestedCertificateSet {
     let mut requested = RequestedCertificateSet {
         certifiers: vec![certifier],
@@ -239,6 +283,41 @@ async fn half_configured_socket_is_disconnected_at_connect_time() {
         .await
         .expect("connect-time half-configuration must disconnect the socket")
         .expect("close observer");
+}
+
+#[tokio::test]
+async fn legacy_server_missing_authentication_success_fails_within_five_seconds() {
+    let url = boot_handshake_only_server().await;
+    let client_identity = identity_of(CLIENT_KEY).await;
+    let wallet = ProtoWallet::new(PrivateKey::from_hex(CLIENT_KEY).expect("client key"));
+    let started = tokio::time::Instant::now();
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        AuthSocketClient::connect(&url, &client_identity, wallet),
+    )
+    .await
+    .expect("legacy failure budget regressed toward the 30-second default");
+    let error = match result {
+        Ok(client) => {
+            let _ = client.disconnect().await;
+            panic!("server intentionally omits authenticationSuccess");
+        }
+        Err(error) => error,
+    };
+    let elapsed = started.elapsed();
+
+    assert!(
+        error
+            .to_string()
+            .contains("authenticationSuccess not received within 5s"),
+        "legacy timeout must report its five-second budget: {error}"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_secs(5)
+            && elapsed < std::time::Duration::from_secs(10),
+        "legacy failure must occur near five seconds, observed {elapsed:?}"
+    );
 }
 
 #[tokio::test]
