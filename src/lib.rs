@@ -42,6 +42,10 @@ pub mod peer_session;
 pub mod transport;
 pub mod wire;
 
+/// The exact bsv-sdk crate version used by authsocket, re-exported so consumers
+/// can name the types appearing in this crate's public API without adding a
+/// potentially divergent direct dependency.
+pub use bsv;
 pub use peer_session::{PeerHandle, VerifiedEvent};
 
 /// The client's liveness cadence, exposed so a consumer can size its own
@@ -50,7 +54,9 @@ pub use peer_session::{PeerHandle, VerifiedEvent};
 /// proves it is alive; `READ_DEADLINE` is how long a peer may be silent before
 /// the watchdog declares it dead.
 #[cfg(feature = "client")]
-pub use client::{KEEPALIVE_INTERVAL, READ_DEADLINE};
+pub use client::{
+    AuthSocketClientOptions, AUTHENTICATION_SUCCESS_TIMEOUT, KEEPALIVE_INTERVAL, READ_DEADLINE,
+};
 pub use wire::{room_id, split_room_id, AUTH_MESSAGE_EVENT};
 
 #[cfg(feature = "server")]
