@@ -145,7 +145,10 @@ async fn is_connected_goes_false_promptly_when_the_server_vanishes() {
     // today — the point of the assertion above is that it fails AFTER the
     // client already admitted it was dead, not before).
     assert!(
-        client.emit("anything", &serde_json::json!({})).await.is_err(),
+        client
+            .emit("anything", &serde_json::json!({}))
+            .await
+            .is_err(),
         "an emit on a dead socket must fail"
     );
 }
