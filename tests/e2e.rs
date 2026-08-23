@@ -20,9 +20,12 @@ use authsocket::peer_session::VerifiedEvent;
 use authsocket::server::{
     AuthSocketServer, CertificateAuthorizationDecision, SharedAuthSocketServer,
 };
-use authsocket::server_io::{attach, emit_signed_to_room, AppDispatcher};
+use authsocket::server_io::{
+    attach, emit_signed_to_room, send_certificate_response, AppDispatcher,
+};
 use authsocket::{wire::decode_event, wire::encode_event, AUTH_MESSAGE_EVENT};
 
+use bsv::auth::certificates::AuthCertificate;
 use bsv::auth::peer::Peer;
 use bsv::auth::types::{AuthMessage, MessageType, RequestedCertificateSet};
 use bsv::primitives::private_key::PrivateKey;
@@ -34,6 +37,7 @@ use bsv::wallet::proto_wallet::ProtoWallet;
 
 const SERVER_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000011";
 const CLIENT_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000022";
+const CERTIFIER_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000033";
 
 async fn identity_of(key_hex: &str) -> String {
     let w = ProtoWallet::new(PrivateKey::from_hex(key_hex).expect("key"));
@@ -136,16 +140,184 @@ fn membership_request(certifier: String) -> RequestedCertificateSet {
     requested
 }
 
-fn membership_certificate(subject: &str, certifier: &str) -> Certificate {
-    Certificate {
+async fn membership_certificate(subject: &str, certifier_key: &str) -> Certificate {
+    let certifier_wallet =
+        ProtoWallet::new(PrivateKey::from_hex(certifier_key).expect("certifier"));
+    let mut certificate = Certificate {
         cert_type: CertificateType([7; 32]),
         serial_number: SerialNumber([9; 32]),
         subject: PublicKey::from_string(subject).expect("subject key"),
-        certifier: PublicKey::from_string(certifier).expect("certifier key"),
+        certifier: PublicKey::from_string(&identity_of(certifier_key).await)
+            .expect("certifier key"),
         revocation_outpoint: Some("00".repeat(32)),
         fields: None,
-        signature: Some(vec![1, 2, 3]),
-    }
+        signature: None,
+    };
+    AuthCertificate::sign(&mut certificate, &certifier_wallet)
+        .await
+        .expect("sign membership certificate");
+    certificate
+}
+
+/// Deterministic stand-in for the consumer's network-backed revocation query.
+async fn membership_is_revoked(revocation_outpoint: &str) -> bool {
+    assert!(!revocation_outpoint.is_empty());
+    false
+}
+
+async fn raw_socket_close_observer(
+    url: &str,
+) -> (
+    rust_socketio::asynchronous::Client,
+    mpsc::UnboundedReceiver<()>,
+) {
+    let (closed_tx, closed_rx) = mpsc::unbounded_channel();
+    let socket = rust_socketio::asynchronous::ClientBuilder::new(url)
+        .on(Event::Close, move |_, _| {
+            let closed = closed_tx.clone();
+            async move {
+                let _ = closed.send(());
+            }
+            .boxed()
+        })
+        .transport_type(TransportType::Websocket)
+        .reconnect(false)
+        .connect()
+        .await
+        .expect("raw Socket.IO connect");
+    (socket, closed_rx)
+}
+
+#[tokio::test]
+async fn silent_pending_socket_is_disconnected_at_configured_deadline() {
+    let core: SharedAuthSocketServer<ProtoWallet> = Arc::new(AuthSocketServer::new());
+    core.set_certificate_authorization_timeout(std::time::Duration::from_millis(100));
+    core.set_certificate_authorizer(|_, _| async { CertificateAuthorizationDecision::Accept });
+    let (url, _core, _dispatched) = boot_server_with_core(core).await;
+    let (_socket, mut closed) = raw_socket_close_observer(&url).await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), closed.recv())
+        .await
+        .expect("deadline task must disconnect a silent Pending socket")
+        .expect("close observer");
+}
+
+#[tokio::test]
+async fn half_configured_socket_is_disconnected_at_connect_time() {
+    let server_identity = identity_of(SERVER_KEY).await;
+    let core: SharedAuthSocketServer<ProtoWallet> = Arc::new(AuthSocketServer::new());
+    core.set_certificates_to_request(membership_request(server_identity));
+    let (url, _core, _dispatched) = boot_server_with_core(core).await;
+    let (_socket, mut closed) = raw_socket_close_observer(&url).await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), closed.recv())
+        .await
+        .expect("connect-time half-configuration must disconnect the socket")
+        .expect("close observer");
+}
+
+#[tokio::test]
+async fn exported_server_certificate_response_reaches_client_verified_channel() {
+    let server_identity = identity_of(SERVER_KEY).await;
+    let certifier_identity = identity_of(CERTIFIER_KEY).await;
+    let server_certificate = membership_certificate(&server_identity, CERTIFIER_KEY).await;
+    let core: SharedAuthSocketServer<ProtoWallet> = Arc::new(AuthSocketServer::new());
+    let (layer, io) = SocketIo::new_layer();
+    let (sent_tx, mut sent_rx) = mpsc::unbounded_channel();
+    let callback_core = core.clone();
+    let callback_io = io.clone();
+    core.listen_for_certificates_requested(Arc::new(move |sid, requester, _| {
+        let core = callback_core.clone();
+        let io = callback_io.clone();
+        let certificate = server_certificate.clone();
+        let sent = sent_tx.clone();
+        tokio::spawn(async move {
+            let emitted =
+                send_certificate_response(&io, &core, &sid, &requester, vec![certificate]).await;
+            let _ = sent.send(emitted);
+        });
+    }));
+    let (seen_tx, _seen_rx) = mpsc::unbounded_channel();
+    attach(
+        &io,
+        core,
+        || {
+            Ok(ProtoWallet::new(
+                PrivateKey::from_hex(SERVER_KEY).expect("server key"),
+            ))
+        },
+        Arc::new(TestDispatcher { seen: seen_tx }),
+    );
+    let app = axum::Router::new().layer(layer);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+
+    let (auth_tx, auth_rx) = mpsc::channel(64);
+    let (ready_tx, mut ready_rx) = mpsc::channel(1);
+    let socket = rust_socketio::asynchronous::ClientBuilder::new(format!("http://{addr}"))
+        .on(AUTH_MESSAGE_EVENT, move |payload, _| {
+            let tx = auth_tx.clone();
+            async move {
+                if let Some(message) = parse_auth_message_from_payload(&payload) {
+                    let _ = tx.send(message).await;
+                }
+            }
+            .boxed()
+        })
+        .on(Event::Connect, move |_, _| {
+            let ready = ready_tx.clone();
+            async move {
+                let _ = ready.try_send(());
+            }
+            .boxed()
+        })
+        .transport_type(TransportType::Websocket)
+        .reconnect(false)
+        .connect()
+        .await
+        .expect("raw Socket.IO connect");
+    tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx.recv())
+        .await
+        .expect("namespace connect ack")
+        .expect("connect channel");
+    let peer = Peer::new(
+        ProtoWallet::new(PrivateKey::from_hex(CLIENT_KEY).expect("client key")),
+        Arc::new(SocketIOTransport::new(socket.clone(), auth_rx)),
+    );
+    peer.set_certificates_to_request(membership_request(certifier_identity));
+    let mut certificates = peer.on_certificates().expect("fresh certificate receiver");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        peer.get_authenticated_session(""),
+    )
+    .await
+    .expect("client handshake timeout")
+    .expect("client handshake");
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), sent_rx.recv())
+            .await
+            .expect("server response helper completion")
+            .expect("response result channel"),
+        "exported helper must emit the SDK-signed server response"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), peer.process_pending())
+        .await
+        .expect("client certificate-response processing timeout")
+        .expect("client must verify the server certificate response");
+    let (signer, batch) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), certificates.recv())
+            .await
+            .expect("verified server certificate delivery")
+            .expect("certificate channel");
+    assert_eq!(signer, server_identity);
+    assert_eq!(batch.len(), 1);
+    socket.disconnect().await.expect("disconnect");
 }
 
 #[tokio::test]
@@ -248,7 +420,7 @@ async fn rejected_certificate_closes_socket_before_authentication_success() {
     .expect("send app event while pending");
     peer.send_certificate_response(
         &verifier,
-        vec![membership_certificate(&client_identity, &server_identity)],
+        vec![membership_certificate(&client_identity, SERVER_KEY).await],
     )
     .await
     .expect("send rejecting certificate response");
@@ -295,18 +467,35 @@ async fn authsocket_client_provides_certificates_to_requiring_server() {
     let authorizer_called = Arc::new(AtomicBool::new(false));
     let authorizer_called_cb = authorizer_called.clone();
     let expected_client = client_identity.clone();
+    let trusted_certifier = server_identity.clone();
     core.set_certificate_authorizer(move |identity, certificates| {
         let called = authorizer_called_cb.clone();
         let expected_client = expected_client.clone();
+        let trusted_certifier = trusted_certifier.clone();
         async move {
             called.store(true, Ordering::SeqCst);
-            if identity == expected_client
-                && certificates.len() == 1
-                && certificates[0].subject.to_der_hex() == identity
+            // bsv-sdk has already authenticated `identity`, the response
+            // signature/replay nonce, and each certificate's subject,
+            // signature, and requested type. Application policy still owns the
+            // certifier trust decision and a live revocation lookup.
+            let certificate = certificates.first();
+            let trusted_metadata = certificates.len() == 1
+                && identity == expected_client
+                && certificate.is_some_and(|certificate| {
+                    certificate.certifier.to_der_hex() == trusted_certifier
+                        && certificate.revocation_outpoint.is_some()
+                });
+            let is_revoked = match certificate.and_then(|cert| cert.revocation_outpoint.as_deref())
             {
+                Some(outpoint) => membership_is_revoked(outpoint).await,
+                None => true,
+            };
+            if trusted_metadata && !is_revoked {
                 CertificateAuthorizationDecision::Accept
             } else {
-                CertificateAuthorizationDecision::Reject("certificate subject mismatch".into())
+                CertificateAuthorizationDecision::Reject(
+                    "untrusted certifier or revoked membership".into(),
+                )
             }
         }
     });
@@ -317,7 +506,7 @@ async fn authsocket_client_provides_certificates_to_requiring_server() {
         &url,
         &client_identity,
         wallet,
-        vec![membership_certificate(&client_identity, &server_identity)],
+        vec![membership_certificate(&client_identity, SERVER_KEY).await],
     )
     .await
     .expect("crate client must complete certificate-gated authentication");
