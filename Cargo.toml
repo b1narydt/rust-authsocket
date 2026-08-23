@@ -41,9 +41,8 @@ socketioxide = { version = "0.15", optional = true }
 rust_socketio = { version = "0.6", features = ["async"], optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 # End-to-end test: a real socketioxide server behind axum + the rust_socketio
 # client, over loopback (tests/e2e.rs, requires --features server,client).
 axum = "0.8"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-

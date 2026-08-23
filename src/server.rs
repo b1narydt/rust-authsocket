@@ -48,16 +48,19 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bsv::auth::error::AuthError;
 use bsv::auth::peer::OnCertificateRequestReceived;
-use bsv::auth::types::{AuthMessage, RequestedCertificateSet};
+use bsv::auth::types::{AuthMessage, MessageType, RequestedCertificateSet};
 use bsv::wallet::interfaces::{Certificate, WalletInterface};
 use futures_util::future::join_all;
 use parking_lot::RwLock;
 use serde_json::Value;
+use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 use crate::peer_session::{PeerHandle, VerifiedEvent};
 
@@ -98,6 +101,11 @@ pub enum CertificateAuthorization {
     },
 }
 
+/// Maximum time a certificate-gated connection may remain pending before it
+/// becomes terminally rejected. The Socket.IO adapter closes the socket at the
+/// same deadline.
+pub const CERTIFICATE_AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(3);
+
 impl CertificateAuthorization {
     /// Whether application events may be dispatched for this connection.
     pub fn is_authorized(&self) -> bool {
@@ -132,6 +140,15 @@ struct Connection<W: WalletInterface + 'static> {
     /// unverified envelope claim.
     identity_key: RwLock<Option<String>>,
     certificate_authorization: RwLock<CertificateAuthorization>,
+    certificate_deadline: Option<Instant>,
+    /// Serializes the only non-terminal certificate authorization transition.
+    certificate_authorization_io: Mutex<()>,
+    /// Once enabled it stays enabled, even after the last request listener is
+    /// removed, so an in-flight response can never race an un-serialized drive.
+    certificate_exchange_enabled: AtomicBool,
+    /// Session-local replay protection for certificateResponse frames. The SDK
+    /// does not provide this for its certificate channel.
+    certificate_response_nonces: RwLock<HashSet<String>>,
     /// SDK callback id for the bridge to the server-wide listener registry.
     certificate_request_bridge_id: RwLock<Option<u64>>,
 }
@@ -194,6 +211,19 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
     /// suppressed. Rejection is terminal for the core connection and is also
     /// exposed through [`Self::certificate_authorization`]; [`crate::server_io::attach`]
     /// closes the corresponding socket immediately.
+    ///
+    /// **Certificates are transport-level unverified. The authorizer MUST
+    /// validate the certifier, certificate signature, revocation status, and
+    /// `certificate.subject == identity_key` before accepting.** Certificate
+    /// records travel in cleartext and can be replayed by any third party that
+    /// has observed them. This core binds a batch to this socket's authenticated
+    /// BRC-103 peer identity; it does not establish certificate validity.
+    ///
+    /// Configuring an authorizer without [`Self::set_certificates_to_request`]
+    /// still gates every new connection as `Pending`; the peer must provide a
+    /// session-bound certificate response before the deadline. The inverse
+    /// configuration (a requested set without an authorizer) is rejected when
+    /// the connection is created and logged as an error.
     pub fn set_certificate_authorizer<F, Fut>(&self, authorizer: F)
     where
         F: Fn(String, Vec<Certificate>) -> Fut + Send + Sync + 'static,
@@ -209,21 +239,44 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
     pub fn add_connection(&self, socket_id: impl Into<String>, wallet: W) {
         let socket_id = socket_id.into();
         let requested = self.certificates_to_request.read().clone();
-        let capture_certificates =
-            requested.is_some() || self.certificate_authorizer.read().is_some();
-        let authorization = if requested.is_some() {
-            CertificateAuthorization::Pending
-        } else {
-            CertificateAuthorization::NotRequired
+        let has_authorizer = self.certificate_authorizer.read().is_some();
+        let (authorization, certificate_deadline) = match (requested.is_some(), has_authorizer) {
+            (_, true) => (
+                CertificateAuthorization::Pending,
+                Some(Instant::now() + CERTIFICATE_AUTHORIZATION_TIMEOUT),
+            ),
+            (true, false) => {
+                tracing::error!(socket = %socket_id,
+                    "authsocket: certificates requested without a certificate authorizer; connection rejected");
+                (
+                    CertificateAuthorization::Rejected {
+                        identity_key: String::new(),
+                        reason: "server requested certificates but no certificate authorizer is configured"
+                            .into(),
+                    },
+                    None,
+                )
+            }
+            (false, false) => (CertificateAuthorization::NotRequired, None),
         };
+        let listeners = self.certificate_request_listeners.read();
         let conn = Arc::new(Connection {
-            handle: PeerHandle::new_for_server(wallet, requested, capture_certificates),
+            handle: PeerHandle::new_for_server(wallet, requested),
             identity_key: RwLock::new(None),
             certificate_authorization: RwLock::new(authorization),
+            certificate_deadline,
+            certificate_authorization_io: Mutex::new(()),
+            certificate_exchange_enabled: AtomicBool::new(has_authorizer || !listeners.is_empty()),
+            certificate_response_nonces: RwLock::new(HashSet::new()),
             certificate_request_bridge_id: RwLock::new(None),
         });
-        self.install_certificate_request_bridge(&socket_id, &conn);
-        self.conns.write().insert(socket_id, conn);
+        // Listener check, bridge installation, and insertion are one atomic
+        // critical section with respect to listen/stop operations.
+        let mut conns = self.conns.write();
+        if !listeners.is_empty() {
+            self.install_certificate_request_bridge(&socket_id, &conn);
+        }
+        conns.insert(socket_id, conn);
     }
 
     /// Drop a socket and its room memberships.
@@ -243,8 +296,41 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
 
     /// Current certificate authorization state for `socket_id`.
     pub fn certificate_authorization(&self, socket_id: &str) -> Option<CertificateAuthorization> {
+        let conn = self.conn(socket_id)?;
+        Self::expire_connection(&conn);
+        Some(conn.certificate_authorization.read().clone())
+    }
+
+    /// Transition an overdue `Pending` connection to terminal rejection.
+    /// Returns `true` only when this call performed the transition.
+    pub fn expire_certificate_authorization(&self, socket_id: &str) -> bool {
+        let Some(conn) = self.conn(socket_id) else {
+            return false;
+        };
+        Self::expire_connection(&conn)
+    }
+
+    fn expire_connection(conn: &Connection<W>) -> bool {
+        if !matches!(conn.certificate_deadline, Some(deadline) if Instant::now() >= deadline) {
+            return false;
+        }
+        let mut authorization = conn.certificate_authorization.write();
+        if !matches!(*authorization, CertificateAuthorization::Pending) {
+            return false;
+        }
+        *authorization = CertificateAuthorization::Rejected {
+            identity_key: conn.identity_key.read().clone().unwrap_or_default(),
+            reason: format!(
+                "certificate authorization timed out after {}s",
+                CERTIFICATE_AUTHORIZATION_TIMEOUT.as_secs()
+            ),
+        };
+        true
+    }
+
+    pub(crate) fn certificate_authorization_deadline(&self, socket_id: &str) -> Option<Instant> {
         self.conn(socket_id)
-            .map(|c| c.certificate_authorization.read().clone())
+            .and_then(|conn| conn.certificate_deadline)
     }
 
     /// Register a server-wide certificate-request listener and install an SDK
@@ -255,17 +341,13 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
         let id = self
             .certificate_request_listener_id
             .fetch_add(1, Ordering::Relaxed);
-        self.certificate_request_listeners
-            .write()
-            .insert(id, callback);
-        let conns: Vec<(String, Arc<Connection<W>>)> = self
-            .conns
-            .read()
-            .iter()
-            .map(|(sid, conn)| (sid.clone(), conn.clone()))
-            .collect();
-        for (sid, conn) in conns {
-            self.install_certificate_request_bridge(&sid, &conn);
+        let mut listeners = self.certificate_request_listeners.write();
+        listeners.insert(id, callback);
+        let conns = self.conns.read();
+        for (sid, conn) in conns.iter() {
+            conn.certificate_exchange_enabled
+                .store(true, Ordering::SeqCst);
+            self.install_certificate_request_bridge(sid, conn);
         }
         id
     }
@@ -273,16 +355,14 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
     /// Stop a server-wide certificate-request listener. Removing the final
     /// listener restores SDK auto-response behavior on all current peers.
     pub fn stop_listening_for_certificates_requested(&self, callback_id: u64) {
-        let empty = {
-            let mut listeners = self.certificate_request_listeners.write();
-            listeners.remove(&callback_id);
-            listeners.is_empty()
-        };
+        let mut listeners = self.certificate_request_listeners.write();
+        listeners.remove(&callback_id);
+        let empty = listeners.is_empty();
         if !empty {
             return;
         }
-        let conns: Vec<Arc<Connection<W>>> = self.conns.read().values().cloned().collect();
-        for conn in conns {
+        let conns = self.conns.read();
+        for conn in conns.values() {
             if let Some(id) = conn.certificate_request_bridge_id.write().take() {
                 conn.handle.stop_listening_for_certificates_requested(id);
             }
@@ -290,9 +370,6 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
     }
 
     fn install_certificate_request_bridge(&self, socket_id: &str, conn: &Arc<Connection<W>>) {
-        if self.certificate_request_listeners.read().is_empty() {
-            return;
-        }
         let mut bridge_id = conn.certificate_request_bridge_id.write();
         if bridge_id.is_some() {
             return;
@@ -323,7 +400,7 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
             AuthError::SessionNotFound(format!("socket connection not found: {socket_id}"))
         })?;
         conn.handle
-            .send_certificate_response(identity_key, certificates)
+            .send_certificate_response_existing(identity_key, certificates)
             .await
     }
 
@@ -341,42 +418,41 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
                 events: vec![],
             };
         };
-        // Peer work outside any map lock — other sockets proceed concurrently.
-        let (outbound, mut events, certificate_batches) =
-            conn.handle.drive_with_certificates(msg).await;
+        Self::expire_connection(&conn);
 
-        for (identity_key, certificates) in certificate_batches {
-            // Rejection is terminal: a later certificate batch cannot revive
-            // a connection the consumer has already denied.
-            if matches!(
+        // The SDK's CertificateResponse dispatch branch performs no session or
+        // signature verification. A configured gate therefore intercepts the
+        // raw frame and never feeds it into that unverified channel.
+        if msg.message_type == MessageType::CertificateResponse
+            && !matches!(
                 *conn.certificate_authorization.read(),
-                CertificateAuthorization::Rejected { .. }
-            ) {
-                continue;
-            }
-            let authorizer = { self.certificate_authorizer.read().clone() };
-            let decision = match authorizer {
-                Some(authorizer) => authorizer(identity_key.clone(), certificates).await,
-                None => CertificateAuthorizationDecision::Reject(
-                    "certificates received but no certificate authorizer is configured".into(),
-                ),
+                CertificateAuthorization::NotRequired
+            )
+        {
+            self.authorize_certificate_response(&conn, msg).await;
+            return Driven {
+                outbound: vec![],
+                events: vec![],
             };
-            let next = match decision {
-                CertificateAuthorizationDecision::Accept => {
-                    CertificateAuthorization::Accepted { identity_key }
-                }
-                CertificateAuthorizationDecision::Reject(reason) => {
-                    CertificateAuthorization::Rejected {
-                        identity_key,
-                        reason,
-                    }
-                }
-            };
-            let mut authorization = conn.certificate_authorization.write();
-            if !matches!(*authorization, CertificateAuthorization::Rejected { .. }) {
-                *authorization = next;
-            }
         }
+        if matches!(
+            *conn.certificate_authorization.read(),
+            CertificateAuthorization::Rejected { .. }
+        ) {
+            return Driven {
+                outbound: vec![],
+                events: vec![],
+            };
+        }
+
+        // Peer work outside any map lock — other sockets proceed concurrently.
+        // The default-off path calls the original drive primitive directly: no
+        // certificate channel allocation and no additional await/yield.
+        let (outbound, mut events) = if conn.certificate_exchange_enabled.load(Ordering::SeqCst) {
+            conn.handle.drive_certificate_aware(msg).await
+        } else {
+            conn.handle.drive(msg).await
+        };
 
         let authorization = conn.certificate_authorization.read().clone();
         match &authorization {
@@ -407,6 +483,93 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
             }
         }
         Driven { outbound, events }
+    }
+
+    async fn authorize_certificate_response(&self, conn: &Arc<Connection<W>>, msg: AuthMessage) {
+        let _transition = conn.certificate_authorization_io.lock().await;
+        if !matches!(
+            *conn.certificate_authorization.read(),
+            CertificateAuthorization::Pending
+        ) {
+            return;
+        }
+
+        let reject = |reason: String| {
+            *conn.certificate_authorization.write() = CertificateAuthorization::Rejected {
+                identity_key: conn.identity_key.read().clone().unwrap_or_default(),
+                reason,
+            };
+        };
+        let Some(your_nonce) = msg.your_nonce.as_deref().filter(|nonce| !nonce.is_empty()) else {
+            reject("certificateResponse is not bound to a local session nonce".into());
+            return;
+        };
+        let session = match conn.handle.authenticated_session_by_nonce(your_nonce).await {
+            Ok(session) => session,
+            Err(error) => {
+                reject(format!(
+                    "certificateResponse has no authenticated session for this socket: {error}"
+                ));
+                return;
+            }
+        };
+        if msg.identity_key != session.peer_identity_key {
+            reject(
+                "certificateResponse envelope identity does not match authenticated peer".into(),
+            );
+            return;
+        }
+        if msg.initial_nonce.as_deref() != Some(session.peer_nonce.as_str()) {
+            reject("certificateResponse peer nonce does not match authenticated session".into());
+            return;
+        }
+        let Some(response_nonce) = msg.nonce.as_deref().filter(|nonce| !nonce.is_empty()) else {
+            reject("certificateResponse is missing its per-message nonce".into());
+            return;
+        };
+        if msg.signature.as_ref().is_none_or(Vec::is_empty) {
+            reject("certificateResponse is missing its transport signature".into());
+            return;
+        }
+        if !conn
+            .certificate_response_nonces
+            .write()
+            .insert(response_nonce.to_string())
+        {
+            reject("replayed certificateResponse nonce".into());
+            return;
+        }
+        let Some(certificates) = msg.certificates.filter(|batch| !batch.is_empty()) else {
+            reject("certificateResponse contains no certificates".into());
+            return;
+        };
+        let Some(authorizer) = self.certificate_authorizer.read().clone() else {
+            reject("certificates received but no certificate authorizer is configured".into());
+            return;
+        };
+
+        // Pass only the peer identity established by this socket's verified
+        // handshake. The raw envelope claim is never an authorization input.
+        let identity_key = session.peer_identity_key;
+        let decision = authorizer(identity_key.clone(), certificates).await;
+
+        // This is the sole post-await transition guard. A timeout/rejection that
+        // won concurrently is terminal and cannot be revived by a late Accept.
+        let mut authorization = conn.certificate_authorization.write();
+        if !matches!(*authorization, CertificateAuthorization::Pending) {
+            return;
+        }
+        *authorization = match decision {
+            CertificateAuthorizationDecision::Accept => {
+                CertificateAuthorization::Accepted { identity_key }
+            }
+            CertificateAuthorizationDecision::Reject(reason) => {
+                CertificateAuthorization::Rejected {
+                    identity_key,
+                    reason,
+                }
+            }
+        };
     }
 
     /// This socket's verified identity key, if a verified general message has
@@ -821,8 +984,17 @@ mod tests {
             .listen_for_certificates_requested(Arc::new(|_, _| {}));
         let server = AuthSocketServer::new();
         server.set_certificates_to_request(requested_certificates(server_identity.clone()));
-        server.set_certificate_authorizer(|_, _| async {
-            CertificateAuthorizationDecision::Reject("membership revoked".into())
+        let decisions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let decisions_cb = decisions.clone();
+        server.set_certificate_authorizer(move |_, _| {
+            let attempt = decisions_cb.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt == 0 {
+                    CertificateAuthorizationDecision::Reject("membership revoked".into())
+                } else {
+                    CertificateAuthorizationDecision::Accept
+                }
+            }
         });
         server.add_connection("sock1", wallet(0x11));
 
@@ -844,18 +1016,45 @@ mod tests {
             }),
             "the rejection and reason are observable by transport consumers"
         );
-        let events = client_send_collect(&server, "sock1", &client, "appPing", &json!({})).await;
+        let rejected_frame = client
+            .peer
+            .create_general_message(&server_identity, encode_event("appPing", &json!({})))
+            .await
+            .expect("sign against existing session");
+        let events = server.on_auth_message("sock1", rejected_frame).await.events;
         assert!(
             events.is_empty(),
             "a rejected peer must never dispatch events"
         );
         assert_eq!(server.identity_key("sock1"), None);
+
+        // A later valid batch whose callback would accept must not run and must
+        // never revive a terminal rejection.
+        send_certificates(
+            &server,
+            "sock1",
+            &client,
+            &server_identity,
+            vec![membership_certificate(&client.identity, &server_identity)],
+        )
+        .await;
+        assert_eq!(decisions.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            server.certificate_authorization("sock1"),
+            Some(CertificateAuthorization::Rejected { reason, .. })
+                if reason == "membership revoked"
+        ));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn no_certificate_configuration_preserves_legacy_handshake() {
         let server = AuthSocketServer::new();
         server.add_connection("sock1", wallet(0x11));
+        let conn = server.conn("sock1").expect("default connection");
+        assert!(
+            conn.handle.peer().on_certificates().is_some(),
+            "default server construction must leave the SDK certificate receiver untouched"
+        );
         let client = test_client(0x22).await;
 
         let payload = encode_event("authenticated", &json!({}));
@@ -867,7 +1066,13 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         };
+        let before = tokio::time::Instant::now();
         let driven = server.on_auth_message("sock1", initial_request).await;
+        assert_eq!(
+            tokio::time::Instant::now(),
+            before,
+            "legacy initialRequest drive must introduce no timer await"
+        );
         assert_eq!(driven.outbound.len(), 1);
         assert_eq!(
             driven.outbound[0].message_type,
@@ -877,6 +1082,9 @@ mod tests {
             driven.outbound[0].requested_certificates.is_none(),
             "default-off must not add requestedCertificates to the wire"
         );
+        assert!(driven.outbound[0].certificates.is_none());
+        assert!(driven.outbound[0].payload.is_none());
+        assert!(driven.outbound[0].signature.is_some());
         assert_eq!(
             server.certificate_authorization("sock1"),
             Some(CertificateAuthorization::NotRequired)
@@ -891,9 +1099,182 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         };
+        let before = tokio::time::Instant::now();
         let driven = server.on_auth_message("sock1", general).await;
+        assert_eq!(
+            tokio::time::Instant::now(),
+            before,
+            "legacy general-message drive must introduce no timer await"
+        );
         assert_eq!(driven.events.len(), 1, "legacy event flow remains admitted");
+        assert!(
+            driven.outbound.is_empty(),
+            "legacy event ordering is unchanged"
+        );
         send.await.expect("send task").expect("send message");
+    }
+
+    #[tokio::test]
+    async fn unsigned_pre_handshake_certificate_response_is_terminally_rejected() {
+        let client_identity = identity_for_scalar(0x22).await;
+        let server_identity = identity_for_scalar(0x11).await;
+        let invocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let invocations_cb = invocations.clone();
+        let server = AuthSocketServer::new();
+        server.set_certificate_authorizer(move |_, _| {
+            invocations_cb.fetch_add(1, Ordering::SeqCst);
+            async { CertificateAuthorizationDecision::Accept }
+        });
+        server.add_connection("sock1", wallet(0x11));
+
+        let driven = server
+            .on_auth_message(
+                "sock1",
+                AuthMessage {
+                    version: "0.1".into(),
+                    message_type: MessageType::CertificateResponse,
+                    identity_key: client_identity.clone(),
+                    nonce: Some("attacker-nonce".into()),
+                    your_nonce: Some("forged-session-nonce".into()),
+                    initial_nonce: None,
+                    certificates: Some(vec![membership_certificate(
+                        &client_identity,
+                        &server_identity,
+                    )]),
+                    requested_certificates: None,
+                    payload: None,
+                    signature: None,
+                },
+            )
+            .await;
+        assert!(driven.outbound.is_empty() && driven.events.is_empty());
+        assert_eq!(invocations.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            server.certificate_authorization("sock1"),
+            Some(CertificateAuthorization::Rejected { identity_key, reason })
+                if identity_key.is_empty() && reason.contains("no authenticated session")
+        ));
+
+        // Terminal means even a subsequent genuine handshake cannot revive or
+        // produce a response/event on this socket.
+        let client = test_client(0x22).await;
+        let peer = client.peer.clone();
+        let send = tokio::spawn(async move {
+            peer.send_message("", encode_event("authenticated", &json!({})))
+                .await
+        });
+        let initial_request = loop {
+            if let Ok(frame) = client.out_rx.lock().await.try_recv() {
+                break frame;
+            }
+            tokio::task::yield_now().await;
+        };
+        let driven = server.on_auth_message("sock1", initial_request).await;
+        assert!(driven.outbound.is_empty() && driven.events.is_empty());
+        send.abort();
+    }
+
+    #[tokio::test]
+    async fn half_configurations_fail_closed_and_are_observable() {
+        let authorizer_only = AuthSocketServer::new();
+        authorizer_only.set_certificate_authorizer(|_, _| async {
+            CertificateAuthorizationDecision::Reject("denied".into())
+        });
+        authorizer_only.add_connection("sock-authorizer", wallet(0x11));
+        assert_eq!(
+            authorizer_only.certificate_authorization("sock-authorizer"),
+            Some(CertificateAuthorization::Pending),
+            "an authorizer by itself must gate instead of silently admitting"
+        );
+
+        let requested_only = AuthSocketServer::new();
+        requested_only
+            .set_certificates_to_request(requested_certificates(identity_for_scalar(0x11).await));
+        requested_only.add_connection("sock-request", wallet(0x11));
+        assert!(matches!(
+            requested_only.certificate_authorization("sock-request"),
+            Some(CertificateAuthorization::Rejected { reason, .. })
+                if reason.contains("no certificate authorizer")
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_certificate_authorization_has_a_terminal_deadline() {
+        let server = AuthSocketServer::new();
+        server
+            .set_certificate_authorizer(|_, _| async { CertificateAuthorizationDecision::Accept });
+        server.add_connection("sock1", wallet(0x11));
+        assert_eq!(
+            server.certificate_authorization("sock1"),
+            Some(CertificateAuthorization::Pending)
+        );
+        tokio::time::advance(CERTIFICATE_AUTHORIZATION_TIMEOUT).await;
+        assert!(matches!(
+            server.certificate_authorization("sock1"),
+            Some(CertificateAuthorization::Rejected { reason, .. })
+                if reason.contains("timed out")
+        ));
+    }
+
+    #[tokio::test]
+    async fn accepted_identity_mismatch_is_terminally_rejected() {
+        let server_identity = identity_for_scalar(0x11).await;
+        let client = test_client(0x22).await;
+        client
+            .peer
+            .listen_for_certificates_requested(Arc::new(|_, _| {}));
+        let server = AuthSocketServer::new();
+        server.set_certificates_to_request(requested_certificates(server_identity.clone()));
+        server
+            .set_certificate_authorizer(|_, _| async { CertificateAuthorizationDecision::Accept });
+        server.add_connection("sock1", wallet(0x11));
+        client_send(&server, "sock1", &client, "authenticated", &json!({})).await;
+        send_certificates(
+            &server,
+            "sock1",
+            &client,
+            &server_identity,
+            vec![membership_certificate(&client.identity, &server_identity)],
+        )
+        .await;
+
+        let victim_identity = identity_for_scalar(0x33).await;
+        let conn = server.conn("sock1").expect("connection");
+        *conn.certificate_authorization.write() = CertificateAuthorization::Accepted {
+            identity_key: victim_identity,
+        };
+        let frame = client
+            .peer
+            .create_general_message(&server_identity, encode_event("appPing", &json!({})))
+            .await
+            .expect("signed general frame");
+        let driven = server.on_auth_message("sock1", frame).await;
+        assert!(driven.events.is_empty());
+        assert!(matches!(
+            server.certificate_authorization("sock1"),
+            Some(CertificateAuthorization::Rejected { reason, .. })
+                if reason.contains("does not match general-message sender")
+        ));
+    }
+
+    #[tokio::test]
+    async fn server_certificate_response_never_initiates_a_handshake() {
+        let server = AuthSocketServer::new();
+        server.listen_for_certificates_requested(Arc::new(|_, _, _| {}));
+        server.add_connection("sock1", wallet(0x11));
+        let unknown_identity = identity_for_scalar(0x22).await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            server.send_certificate_response("sock1", &unknown_identity, Vec::new()),
+        )
+        .await
+        .expect("must fail immediately without polling for a handshake");
+        assert!(matches!(result, Err(AuthError::SessionNotFound(_))));
+        let conn = server.conn("sock1").expect("connection");
+        assert!(
+            conn.handle.drain_outbound().await.is_empty(),
+            "non-initiating response must not queue an initialRequest"
+        );
     }
 
     #[tokio::test]

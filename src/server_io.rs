@@ -56,8 +56,9 @@ pub trait AppDispatcher<W: WalletInterface + 'static>: Send + Sync {
 /// app events. To require peer certificates, call
 /// [`AuthSocketServer::set_certificates_to_request`] and
 /// [`AuthSocketServer::set_certificate_authorizer`] on `server` before calling
-/// `attach`; this adapter then withholds `authenticationSuccess` until acceptance
-/// and disconnects immediately on rejection.
+/// `attach`. The transport-agnostic core suppresses verified events (including
+/// `authenticated`) until acceptance; this adapter observes terminal rejection
+/// and disconnects the socket before any event can be dispatched.
 pub fn attach<W, F, D>(
     io: &SocketIo,
     server: SharedAuthSocketServer<W>,
@@ -84,6 +85,33 @@ pub fn attach<W, F, D>(
                 socket.disconnect().ok();
                 return;
             }
+        }
+
+        // Half-configuration is a connection-time terminal error, and Pending
+        // has a bounded lifetime. Close here (or from the deadline task) without
+        // waiting for another inbound frame to make the outcome observable.
+        if let Some(authorization) = server.certificate_authorization(&sid) {
+            if let Some(reason) = authorization.rejection_reason() {
+                warn!(sid = %sid, reason = %reason,
+                    "authsocket: certificate configuration rejected connection — closing socket");
+                server.remove_connection(&sid);
+                socket.disconnect().ok();
+                return;
+            }
+        }
+        if let Some(deadline) = server.certificate_authorization_deadline(&sid) {
+            let server_timeout = server.clone();
+            let socket_timeout = socket.clone();
+            let sid_timeout = sid.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep_until(deadline).await;
+                if server_timeout.expire_certificate_authorization(&sid_timeout) {
+                    warn!(sid = %sid_timeout,
+                        "authsocket: certificate authorization deadline expired — closing socket");
+                    server_timeout.remove_connection(&sid_timeout);
+                    socket_timeout.disconnect().ok();
+                }
+            });
         }
 
         let server_msg = server.clone();
