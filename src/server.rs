@@ -111,11 +111,18 @@ pub enum CertificateAuthorization {
 /// tune it before adding connections.
 pub const CERTIFICATE_AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Pending peers are not application-authorized, so retain only a small,
-/// explicitly bounded amount of their verified traffic while the certificate
-/// decision is outstanding.
-const MAX_DEFERRED_EVENTS: usize = 32;
-const MAX_DEFERRED_EVENT_BYTES: usize = 256 * 1024;
+/// Default maximum number of verified application events retained while a
+/// certificate decision is pending.
+pub const MAX_DEFERRED_EVENTS: usize = 32;
+
+/// Default maximum encoded size of verified application events retained while
+/// a certificate decision is pending.
+///
+/// This counts the sender and event-name strings plus compact serialized JSON.
+/// It is an admission bound, not a measurement of resident heap memory:
+/// [`serde_json::Value`] and its allocations can occupy several times their
+/// encoded size.
+pub const MAX_DEFERRED_EVENT_BYTES: usize = 256 * 1024;
 
 impl CertificateAuthorization {
     /// The rejection reason, if authorization failed.
@@ -191,10 +198,22 @@ struct Connection<W: WalletInterface + 'static> {
     certificate_authorization: RwLock<CertificateAuthorization>,
     certificate_deadline: Option<Instant>,
     certificate_timeout: Option<Duration>,
+    max_deferred_events: usize,
+    max_deferred_event_bytes: usize,
     /// Serializes short authorization transitions with pending-event deferral.
     /// It is never held across an await, so a hung authorizer cannot strand
     /// concurrent frame handlers behind it.
+    ///
+    /// Per-connection blocking locks follow one order: snapshot and release
+    /// `session_peer_identity_key` first; then, when a transition needs more
+    /// than one lock, take `deferred_events`, `certificate_authorization`,
+    /// `identity_key`, and `certificate_deadline_task` in that order. Never
+    /// nest the session-identity lock with any of the transition locks.
     deferred_events: Mutex<DeferredEvents>,
+    /// Claims the one consumer-authorizer future allowed for this Pending
+    /// decision. The claim is acquired under `deferred_events` before awaiting
+    /// and cleared by every terminal transition.
+    certificate_authorizer_in_flight: AtomicBool,
     /// Aborted when authorization resolves or the socket disconnects, so the
     /// deadline task does not retain the socket/server until the full timeout.
     certificate_deadline_task: RwLock<Option<JoinHandle<()>>>,
@@ -229,6 +248,8 @@ pub struct AuthSocketServer<W: WalletInterface + 'static> {
     certificate_authorizer: RwLock<Option<CertificateAuthorizer>>,
     /// Snapshotted by each newly-created connection.
     certificate_authorization_timeout: RwLock<Duration>,
+    /// Snapshotted by each newly-created connection.
+    certificate_authorization_deferral_limits: RwLock<(usize, usize)>,
     certificate_request_listeners: Arc<RwLock<HashMap<u64, Arc<OnCertificatesRequested>>>>,
     certificate_request_listener_id: AtomicU64,
 }
@@ -247,6 +268,10 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
             certificates_to_request: RwLock::new(None),
             certificate_authorizer: RwLock::new(None),
             certificate_authorization_timeout: RwLock::new(CERTIFICATE_AUTHORIZATION_TIMEOUT),
+            certificate_authorization_deferral_limits: RwLock::new((
+                MAX_DEFERRED_EVENTS,
+                MAX_DEFERRED_EVENT_BYTES,
+            )),
             certificate_request_listeners: Arc::new(RwLock::new(HashMap::new())),
             certificate_request_listener_id: AtomicU64::new(0),
         }
@@ -268,6 +293,31 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
             "certificate authorization timeout must be non-zero"
         );
         *self.certificate_authorization_timeout.write() = timeout;
+    }
+
+    /// Set the pending-event admission limits for subsequently-created
+    /// connections. Existing connections retain their snapshotted limits.
+    ///
+    /// The defaults are [`MAX_DEFERRED_EVENTS`] and
+    /// [`MAX_DEFERRED_EVENT_BYTES`]. A pending peer is terminally rejected when
+    /// either limit would be exceeded. The standard client sends a verified
+    /// `authenticated` keepalive every 10 seconds even before
+    /// `authenticationSuccess`, so authorization timeouts around 320 seconds
+    /// or longer can require a larger event limit. Raising either limit trades
+    /// a larger per-connection resource budget for a longer pending window.
+    /// The byte limit counts encoded JSON, not the larger resident footprint
+    /// of the retained [`serde_json::Value`] tree.
+    pub fn set_certificate_authorization_deferral_limits(
+        &self,
+        max_events: usize,
+        max_encoded_bytes: usize,
+    ) {
+        assert!(max_events > 0, "maximum deferred events must be non-zero");
+        assert!(
+            max_encoded_bytes > 0,
+            "maximum deferred encoded bytes must be non-zero"
+        );
+        *self.certificate_authorization_deferral_limits.write() = (max_events, max_encoded_bytes);
     }
 
     /// Register the async accept/reject decision for received certificates.
@@ -297,6 +347,17 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
     /// snapshotted at connect time and never retrofits existing sockets. An
     /// accepted socket does not re-run this authorizer for later certificate
     /// responses: renewal, rotation, and step-up require a new connection.
+    /// Exactly one batch can invoke the authorizer for that decision; concurrent
+    /// or later certificate responses do not start additional authorizer
+    /// futures.
+    ///
+    /// Verified application events received while the decision is pending are
+    /// retained only up to [`MAX_DEFERRED_EVENTS`] and
+    /// [`MAX_DEFERRED_EVENT_BYTES`] by default. See
+    /// [`Self::set_certificate_authorization_deferral_limits`] when configuring
+    /// a long authorization timeout. The byte limit is based on compact JSON
+    /// size and does not represent the larger in-memory size of
+    /// [`serde_json::Value`].
     ///
     /// Configuring an authorizer without [`Self::set_certificates_to_request`]
     /// still gates every new connection as `Pending`; the peer must provide a
@@ -320,6 +381,8 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
         let requested = self.certificates_to_request.read().clone();
         let has_authorizer = self.certificate_authorizer.read().is_some();
         let authorization_timeout = *self.certificate_authorization_timeout.read();
+        let (max_deferred_events, max_deferred_event_bytes) =
+            *self.certificate_authorization_deferral_limits.read();
         let (authorization, certificate_deadline) = match (requested.is_some(), has_authorizer) {
             (_, true) => (
                 CertificateAuthorization::Pending,
@@ -347,7 +410,10 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
             certificate_authorization: RwLock::new(authorization),
             certificate_deadline,
             certificate_timeout: has_authorizer.then_some(authorization_timeout),
+            max_deferred_events,
+            max_deferred_event_bytes,
             deferred_events: Mutex::new(DeferredEvents::default()),
+            certificate_authorizer_in_flight: AtomicBool::new(false),
             certificate_deadline_task: RwLock::new(None),
             certificate_exchange_enabled: AtomicBool::new(has_authorizer || !listeners.is_empty()),
             certificate_request_bridge_id: RwLock::new(None),
@@ -399,8 +465,11 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
         let Some(conn) = self.conn(socket_id) else {
             return false;
         };
-        // The deadline task must not abort itself before it can remove and
-        // disconnect the socket.
+        // Skip aborting here so the task can reach the adapter's cleanup. The
+        // subsequent remove_connection takes and aborts this task's own handle;
+        // that is safe because Tokio cancellation is cooperative and the
+        // adapter performs both removal and SocketRef::disconnect synchronously,
+        // with no await at which the self-abort could take effect.
         Self::expire_connection(&conn, false)
     }
 
@@ -420,6 +489,8 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
                 conn.certificate_timeout.unwrap_or_default().as_secs_f64()
             ),
         };
+        conn.certificate_authorizer_in_flight
+            .store(false, Ordering::SeqCst);
         deferred.clear();
         drop(authorization);
         drop(deferred);
@@ -573,15 +644,7 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
         let (outbound, mut events) = if conn.certificate_exchange_enabled.load(Ordering::SeqCst) {
             let certificate_drive = conn.handle.drive_certificate_aware(msg).await;
             if message_type == MessageType::InitialRequest && certificate_drive.error.is_none() {
-                let mut session_identity = conn.session_peer_identity_key.write();
-                match session_identity.as_ref() {
-                    None => *session_identity = Some(message_identity_key),
-                    Some(identity) if identity == &message_identity_key => {}
-                    Some(_) => Self::reject_pending_certificate_response(
-                        &conn,
-                        "BRC-103 session identity changed on one socket".into(),
-                    ),
-                }
+                Self::record_session_peer_identity(&conn, message_identity_key);
             }
             if certificate_response {
                 if let Some(error) = &certificate_drive.error {
@@ -622,6 +685,29 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
         Self::reject_pending_with_deferred(conn, &mut deferred, reason);
     }
 
+    fn record_session_peer_identity(conn: &Connection<W>, identity_key: String) {
+        // Never call a transition while holding the session lock. In
+        // particular, rejection takes deferred_events; authorize takes its
+        // session snapshot before deferred_events, so nesting these would
+        // recreate a session/deferred lock-order cycle.
+        let identity_changed = {
+            let mut session_identity = conn.session_peer_identity_key.write();
+            match session_identity.as_ref() {
+                None => {
+                    *session_identity = Some(identity_key);
+                    false
+                }
+                Some(identity) => identity != &identity_key,
+            }
+        };
+        if identity_changed {
+            Self::reject_pending_certificate_response(
+                conn,
+                "BRC-103 session identity changed on one socket".into(),
+            );
+        }
+    }
+
     fn reject_pending_with_deferred(
         conn: &Connection<W>,
         deferred: &mut DeferredEvents,
@@ -633,6 +719,8 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
                 identity_key: conn.identity_key.read().clone().unwrap_or_default(),
                 reason,
             };
+            conn.certificate_authorizer_in_flight
+                .store(false, Ordering::SeqCst);
             deferred.clear();
             drop(authorization);
             Self::abort_certificate_deadline_task(conn);
@@ -666,6 +754,8 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
                         identity_key,
                         reason: "certificate identity does not match general-message sender".into(),
                     };
+                    conn.certificate_authorizer_in_flight
+                        .store(false, Ordering::SeqCst);
                     deferred.clear();
                     events.clear();
                     Self::abort_certificate_deadline_task(conn);
@@ -676,12 +766,13 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
                     bytes.saturating_add(deferred_event_bytes(event))
                 });
                 let exceeds_count =
-                    deferred.events.len().saturating_add(events.len()) > MAX_DEFERRED_EVENTS;
+                    deferred.events.len().saturating_add(events.len()) > conn.max_deferred_events;
                 let exceeds_bytes =
-                    deferred.bytes.saturating_add(incoming_bytes) > MAX_DEFERRED_EVENT_BYTES;
+                    deferred.bytes.saturating_add(incoming_bytes) > conn.max_deferred_event_bytes;
                 if exceeds_count || exceeds_bytes {
                     let reason = format!(
-                        "certificate authorization deferral limit exceeded (max {MAX_DEFERRED_EVENTS} events / {MAX_DEFERRED_EVENT_BYTES} bytes)"
+                        "certificate authorization deferral limit exceeded (max {} events / {} encoded bytes)",
+                        conn.max_deferred_events, conn.max_deferred_event_bytes
                     );
                     Self::reject_pending_with_deferred(conn, &mut deferred, reason);
                     events.clear();
@@ -706,6 +797,11 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
         identity_key: String,
         certificates: Vec<Certificate>,
     ) -> Vec<VerifiedEvent> {
+        // Session identity is deliberately snapshotted before deferred_events
+        // and its guard is dropped immediately. No path may nest the session
+        // lock with authorization-transition locks.
+        let session_identity_matches =
+            conn.session_peer_identity_key.read().as_deref() == Some(identity_key.as_str());
         {
             let mut deferred = conn.deferred_events.lock();
             if !matches!(
@@ -716,14 +812,23 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
                 return Vec::new();
             }
 
-            if conn.session_peer_identity_key.read().as_deref() != Some(identity_key.as_str()) {
-                *conn.certificate_authorization.write() = CertificateAuthorization::Rejected {
-                    identity_key,
-                    reason: "certificate-response signer does not match the BRC-103 session peer"
-                        .into(),
-                };
-                deferred.clear();
-                Self::abort_certificate_deadline_task(conn);
+            if !session_identity_matches {
+                Self::reject_pending_with_deferred(
+                    conn,
+                    &mut deferred,
+                    "certificate-response signer does not match the BRC-103 session peer".into(),
+                );
+                return Vec::new();
+            }
+
+            // Pending means no terminal decision exists, but it no longer
+            // implies that no authorizer is running. Claim the single allowed
+            // authorizer before releasing the transition mutex and awaiting.
+            if conn
+                .certificate_authorizer_in_flight
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
                 return Vec::new();
             }
         }
@@ -765,6 +870,8 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
         let mut deferred = conn.deferred_events.lock();
         let mut authorization = conn.certificate_authorization.write();
         if !matches!(*authorization, CertificateAuthorization::Pending) {
+            conn.certificate_authorizer_in_flight
+                .store(false, Ordering::SeqCst);
             deferred.clear();
             return Vec::new();
         }
@@ -780,6 +887,8 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
                 }
             }
         };
+        conn.certificate_authorizer_in_flight
+            .store(false, Ordering::SeqCst);
         drop(authorization);
         Self::abort_certificate_deadline_task(conn);
         if accepted {
@@ -910,6 +1019,7 @@ mod tests {
     use bsv::wallet::interfaces::{Certificate, CertificateType, SerialNumber};
     use bsv::wallet::proto_wallet::ProtoWallet;
     use serde_json::json;
+    use std::sync::atomic::AtomicUsize;
 
     use crate::transport::ChannelTransport;
     use crate::wire::encode_event;
@@ -1256,6 +1366,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_certificate_responses_invoke_authorizer_once() {
+        const RESPONSE_COUNT: usize = 8;
+
+        let server_identity = identity_for_scalar(0x11).await;
+        let client = test_client(0x22).await;
+        client
+            .peer
+            .listen_for_certificates_requested(Arc::new(|_, _| {}));
+        let server = Arc::new(AuthSocketServer::new());
+        server.set_certificates_to_request(requested_certificates(server_identity.clone()));
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let invocations_cb = invocations.clone();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let started_cb = started.clone();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let release_cb = release.clone();
+        server.set_certificate_authorizer(move |_, _| {
+            let invocations = invocations_cb.clone();
+            let started = started_cb.clone();
+            let release = release_cb.clone();
+            async move {
+                invocations.fetch_add(1, Ordering::SeqCst);
+                started.notify_one();
+                release.notified().await;
+                CertificateAuthorizationDecision::Accept
+            }
+        });
+        server.add_connection("sock1", wallet(0x11));
+        client_send(&server, "sock1", &client, "authenticated", &json!({})).await;
+
+        let certificate = membership_certificate(&client.identity, 0x11).await;
+        let mut frames = Vec::with_capacity(RESPONSE_COUNT);
+        for _ in 0..RESPONSE_COUNT {
+            frames.push(
+                certificate_response_frame(&client, &server_identity, vec![certificate.clone()])
+                    .await,
+            );
+        }
+
+        let drives = frames.into_iter().map(|frame| {
+            let server = server.clone();
+            tokio::spawn(async move { server.on_auth_message("sock1", frame).await })
+        });
+        let drives = drives.collect::<Vec<_>>();
+        started.notified().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "one Pending decision must have exactly one in-flight authorizer"
+        );
+
+        release.notify_waiters();
+        for drive in drives {
+            drive.await.expect("certificate-response drive");
+        }
+        assert!(matches!(
+            server.certificate_authorization("sock1"),
+            Some(CertificateAuthorization::Accepted { .. })
+        ));
+        assert!(
+            !server
+                .conn("sock1")
+                .expect("connection")
+                .certificate_authorizer_in_flight
+                .load(Ordering::SeqCst),
+            "the terminal transition must clear the in-flight claim"
+        );
+    }
+
+    #[test]
+    fn session_identity_lock_is_released_before_pending_rejection() {
+        let server = AuthSocketServer::new();
+        server
+            .set_certificate_authorizer(|_, _| async { CertificateAuthorizationDecision::Accept });
+        server.add_connection("sock1", wallet(0x11));
+        let conn = server.conn("sock1").expect("connection");
+        *conn.session_peer_identity_key.write() = Some("original identity".into());
+
+        // Hold both locks that reproduce the old inversion window. The worker
+        // first blocks on session_identity. Once released, fixed code drops
+        // that guard before it blocks on deferred_events for rejection.
+        let deferred = conn.deferred_events.lock();
+        let session = conn.session_peer_identity_key.read();
+        let (attempting_tx, attempting_rx) = std::sync::mpsc::sync_channel(0);
+        let conn_worker = conn.clone();
+        let worker = std::thread::spawn(move || {
+            attempting_tx.send(()).expect("signal lock attempt");
+            AuthSocketServer::record_session_peer_identity(
+                &conn_worker,
+                "different identity".into(),
+            );
+        });
+        attempting_rx.recv().expect("worker lock attempt");
+        drop(session);
+
+        let session = conn
+            .session_peer_identity_key
+            .try_write_for(Duration::from_secs(1))
+            .expect("rejection must not hold session identity while waiting for deferred events");
+        drop(session);
+        drop(deferred);
+        worker.join().expect("identity mismatch worker");
+
+        assert!(matches!(
+            server.certificate_authorization("sock1"),
+            Some(CertificateAuthorization::Rejected { reason, .. })
+                if reason.contains("session identity changed")
+        ));
+    }
+
+    #[tokio::test]
     async fn pending_event_overflow_is_terminal_and_releases_retained_payloads() {
         let server = AuthSocketServer::new();
         server
@@ -1306,6 +1528,35 @@ mod tests {
                 if reason.contains("deferral limit exceeded")
         ));
         assert!(conn.deferred_events.lock().events.is_empty());
+    }
+
+    #[test]
+    fn configured_deferral_limits_are_snapshotted_by_new_connections() {
+        let server = AuthSocketServer::new();
+        server
+            .set_certificate_authorizer(|_, _| async { CertificateAuthorizationDecision::Accept });
+        server.set_certificate_authorization_deferral_limits(
+            MAX_DEFERRED_EVENTS + 1,
+            MAX_DEFERRED_EVENT_BYTES,
+        );
+        server.add_connection("sock1", wallet(0x11));
+        let conn = server.conn("sock1").expect("connection");
+        let mut events = (0..=MAX_DEFERRED_EVENTS)
+            .map(|sequence| VerifiedEvent {
+                sender: "pending peer".into(),
+                event_name: "withinConfiguredLimit".into(),
+                data: json!({ "sequence": sequence }),
+            })
+            .collect::<Vec<_>>();
+
+        server.gate_or_defer_events("sock1", &conn, &mut events);
+
+        assert!(events.is_empty());
+        assert_eq!(conn.deferred_events.lock().events.len(), 33);
+        assert_eq!(
+            server.certificate_authorization("sock1"),
+            Some(CertificateAuthorization::Pending)
+        );
     }
 
     #[tokio::test]
