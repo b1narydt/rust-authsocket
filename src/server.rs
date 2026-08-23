@@ -38,6 +38,13 @@
 //!   brief `parking_lot::RwLock`s; per-socket handles are `Arc`s cloned out
 //!   under the lock, and all Peer work (drive/sign) runs outside any map lock.
 //!   Fan-out signs run concurrently (`join_all`), not in a sequential loop.
+//! - **One per-connection lock order, stated on `Connection::deferred_events`.**
+//!   Read it before adding a lock to any path. socketioxide spawns a task per
+//!   inbound frame, so one socket's handlers run concurrently and these are
+//!   blocking locks: an inversion wedges tokio workers permanently rather than
+//!   parking them. That is not hypothetical — a rejection path once acquired
+//!   the deferral lock while holding the session-identity guard, inverting a
+//!   path that already held them the other way round.
 //!
 //! **The fix this replaces:** the old server `broadcast_to_room` did a RAW,
 //! unsigned `io.to(room).emit(...)`, which only hit the client's fallback
