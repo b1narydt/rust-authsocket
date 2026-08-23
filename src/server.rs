@@ -1467,6 +1467,16 @@ mod tests {
             );
         });
         attempting_rx.recv().expect("worker lock attempt");
+        // The rendezvous only proves the worker sent, not that it has queued on
+        // `session_peer_identity_key`. Without this park the main thread usually
+        // re-acquires the lock in the handful of instructions after `drop`, and
+        // the inversion is never exercised: restoring the pre-fix body of
+        // `record_session_peer_identity` passed 27 of 40 runs, so a reintroduced
+        // deadlock would clear CI roughly two times in three. Once the worker is
+        // genuinely queued, parking_lot hands it the write on release, so the
+        // buggy ordering holds the guard and the `try_write_for` below times out
+        // deterministically.
+        std::thread::sleep(Duration::from_millis(50));
         drop(session);
 
         let session = conn
