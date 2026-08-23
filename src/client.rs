@@ -96,9 +96,44 @@ const WATCHDOG_TICK: Duration = Duration::from_secs(2);
 /// before failing the connection.
 const CONNECT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Maximum time to wait for the server's signed `authenticationSuccess` after
-/// the BRC-103 handshake.
-const AUTH_SUCCESS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default maximum time to wait for the server's signed
+/// `authenticationSuccess` after the BRC-103 handshake.
+///
+/// This matches the server's default certificate-authorization budget. Use
+/// [`AuthSocketClientOptions::set_authentication_success_timeout`] when the
+/// server is configured with a different budget.
+pub const AUTHENTICATION_SUCCESS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Connection-time settings for [`AuthSocketClient`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthSocketClientOptions {
+    authentication_success_timeout: Duration,
+}
+
+impl Default for AuthSocketClientOptions {
+    fn default() -> Self {
+        Self {
+            authentication_success_timeout: AUTHENTICATION_SUCCESS_TIMEOUT,
+        }
+    }
+}
+
+impl AuthSocketClientOptions {
+    /// Set how long connection establishment waits for the server's signed
+    /// `authenticationSuccess`, including any certificate authorization.
+    pub fn set_authentication_success_timeout(&mut self, timeout: Duration) {
+        assert!(
+            !timeout.is_zero(),
+            "authentication success timeout must be non-zero"
+        );
+        self.authentication_success_timeout = timeout;
+    }
+
+    /// The configured authentication-success timeout.
+    pub fn authentication_success_timeout(&self) -> Duration {
+        self.authentication_success_timeout
+    }
+}
 
 /// Client-side errors.
 #[derive(Debug)]
@@ -304,7 +339,26 @@ impl AuthSocketClient {
     where
         W: WalletInterface + Send + Sync + 'static,
     {
-        Self::connect_inner(url, identity_key, wallet, None).await
+        Self::connect_with_options(
+            url,
+            identity_key,
+            wallet,
+            AuthSocketClientOptions::default(),
+        )
+        .await
+    }
+
+    /// Connect with explicit connection-time settings.
+    pub async fn connect_with_options<W>(
+        url: &str,
+        identity_key: &str,
+        wallet: W,
+        options: AuthSocketClientOptions,
+    ) -> Result<Self, ClientError>
+    where
+        W: WalletInterface + Send + Sync + 'static,
+    {
+        Self::connect_inner(url, identity_key, wallet, None, options).await
     }
 
     /// Connect and answer certificate requests with `certificates` before the
@@ -318,12 +372,34 @@ impl AuthSocketClient {
     where
         W: WalletInterface + Send + Sync + 'static,
     {
+        Self::connect_with_certificates_and_options(
+            url,
+            identity_key,
+            wallet,
+            certificates,
+            AuthSocketClientOptions::default(),
+        )
+        .await
+    }
+
+    /// Connect with a fixed certificate batch and explicit connection-time
+    /// settings.
+    pub async fn connect_with_certificates_and_options<W>(
+        url: &str,
+        identity_key: &str,
+        wallet: W,
+        certificates: Vec<Certificate>,
+        options: AuthSocketClientOptions,
+    ) -> Result<Self, ClientError>
+    where
+        W: WalletInterface + Send + Sync + 'static,
+    {
         let certificates = Arc::new(certificates);
         let provider: CertificateProvider = Arc::new(move |_, _| {
             let certificates = certificates.clone();
             Box::pin(async move { Ok((*certificates).clone()) })
         });
-        Self::connect_inner(url, identity_key, wallet, Some(provider)).await
+        Self::connect_inner(url, identity_key, wallet, Some(provider), options).await
     }
 
     /// Connect with an async certificate provider. Unlike the SDK's automatic
@@ -339,7 +415,29 @@ impl AuthSocketClient {
     where
         W: WalletInterface + Send + Sync + 'static,
     {
-        Self::connect_inner(url, identity_key, wallet, Some(provider)).await
+        Self::connect_with_certificate_provider_and_options(
+            url,
+            identity_key,
+            wallet,
+            provider,
+            AuthSocketClientOptions::default(),
+        )
+        .await
+    }
+
+    /// Connect with an async certificate provider and explicit
+    /// connection-time settings.
+    pub async fn connect_with_certificate_provider_and_options<W>(
+        url: &str,
+        identity_key: &str,
+        wallet: W,
+        provider: CertificateProvider,
+        options: AuthSocketClientOptions,
+    ) -> Result<Self, ClientError>
+    where
+        W: WalletInterface + Send + Sync + 'static,
+    {
+        Self::connect_inner(url, identity_key, wallet, Some(provider), options).await
     }
 
     async fn connect_inner<W>(
@@ -347,10 +445,12 @@ impl AuthSocketClient {
         identity_key: &str,
         wallet: W,
         certificate_provider: Option<CertificateProvider>,
+        options: AuthSocketClientOptions,
     ) -> Result<Self, ClientError>
     where
         W: WalletInterface + Send + Sync + 'static,
     {
+        let certificate_provider_configured = certificate_provider.is_some();
         let handlers: HandlerMap = Arc::new(Mutex::new(HashMap::new()));
         let fallback: Arc<Mutex<Option<FallbackHandler>>> = Arc::new(Mutex::new(None));
         let joined_rooms: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -557,12 +657,12 @@ impl AuthSocketClient {
         // establishes the session, waits for any requested response to be sent,
         // and only then sends the first `authenticated` general message.
         let auth_payload = encode_event("authenticated", &json!({ "identityKey": identity_key }));
-        let handshake_result = if certificate_provider.is_some() {
+        let handshake_result = if certificate_provider_configured {
             match peer.get_authenticated_session("").await {
                 Ok(session) => {
                     if certificate_requested.load(Ordering::SeqCst) {
                         match tokio::time::timeout(
-                            AUTH_SUCCESS_TIMEOUT,
+                            options.authentication_success_timeout,
                             certificate_result_rx.recv(),
                         )
                         .await
@@ -579,7 +679,7 @@ impl AuthSocketClient {
                             )),
                             Err(_) => Err(AuthError::TransportError(format!(
                                 "certificate response was not sent within {}s",
-                                AUTH_SUCCESS_TIMEOUT.as_secs()
+                                options.authentication_success_timeout.as_secs_f64()
                             ))),
                         }
                     } else {
@@ -594,9 +694,15 @@ impl AuthSocketClient {
         };
         if let Err(e) = handshake_result {
             abandon(client, connected, dead).await;
-            let message = if certificate_requested.load(Ordering::SeqCst) {
+            let message = if certificate_requested.load(Ordering::SeqCst)
+                && !certificate_provider_configured
+            {
                 format!(
                     "certificate provisioning failed after the server requested certificates: {e}; configure connect_with_certificates or connect_with_certificate_provider"
+                )
+            } else if certificate_requested.load(Ordering::SeqCst) {
+                format!(
+                    "certificate provisioning failed after the server requested certificates: {e}"
                 )
             } else {
                 e.to_string()
@@ -817,13 +923,19 @@ impl AuthSocketClient {
         }
 
         // Wait for the server's signed authenticationSuccess.
-        match tokio::time::timeout(AUTH_SUCCESS_TIMEOUT, auth_success_rx).await {
+        match tokio::time::timeout(options.authentication_success_timeout, auth_success_rx).await {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(reason))) => {
                 abandon(client, connected, dead).await;
-                let message = if certificate_requested.load(Ordering::SeqCst) {
+                let message = if certificate_requested.load(Ordering::SeqCst)
+                    && !certificate_provider_configured
+                {
                     format!(
                         "{reason}; the server requested certificates, so configure connect_with_certificates or connect_with_certificate_provider and ensure the server accepts the batch"
+                    )
+                } else if certificate_requested.load(Ordering::SeqCst) {
+                    format!(
+                        "{reason}; the server closed before certificate authorization completed"
                     )
                 } else {
                     reason
@@ -838,15 +950,22 @@ impl AuthSocketClient {
             }
             Err(_) => {
                 abandon(client, connected, dead).await;
-                let message = if certificate_requested.load(Ordering::SeqCst) {
+                let message = if certificate_requested.load(Ordering::SeqCst)
+                    && !certificate_provider_configured
+                {
                     format!(
                         "authenticationSuccess not received within {}s after the server requested certificates; configure connect_with_certificates or connect_with_certificate_provider and ensure the server accepts the batch",
-                        AUTH_SUCCESS_TIMEOUT.as_secs()
+                        options.authentication_success_timeout.as_secs_f64()
+                    )
+                } else if certificate_requested.load(Ordering::SeqCst) {
+                    format!(
+                        "authenticationSuccess not received within {}s after the certificate response was sent; align AuthSocketClientOptions with the server's certificate-authorization timeout",
+                        options.authentication_success_timeout.as_secs_f64()
                     )
                 } else {
                     format!(
                         "authenticationSuccess not received within {}s",
-                        AUTH_SUCCESS_TIMEOUT.as_secs()
+                        options.authentication_success_timeout.as_secs_f64()
                     )
                 };
                 return Err(ClientError::Handshake(message));
@@ -995,6 +1114,20 @@ mod tests {
         assert!(
             WATCHDOG_TICK < KEEPALIVE_INTERVAL,
             "the watchdog must sample faster than the signal it watches"
+        );
+    }
+
+    #[test]
+    fn authentication_timeout_defaults_to_server_budget_and_is_configurable() {
+        let mut options = AuthSocketClientOptions::default();
+        assert_eq!(
+            options.authentication_success_timeout(),
+            Duration::from_secs(30)
+        );
+        options.set_authentication_success_timeout(Duration::from_secs(45));
+        assert_eq!(
+            options.authentication_success_timeout(),
+            Duration::from_secs(45)
         );
     }
 
