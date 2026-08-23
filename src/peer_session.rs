@@ -79,8 +79,10 @@ pub struct PeerHandle<W: WalletInterface + 'static> {
     /// Serializes certificate-aware driving with server-side certificate
     /// responses so neither operation can drain the other's outbound frames.
     certificate_io: Mutex<()>,
-    /// SDK-verified certificate batches. Taken only for certificate-gated
-    /// server peers; the exact default-off construction leaves it untouched.
+    /// SDK-verified certificate batches. Present only for certificate-gated
+    /// server peers. Every build takes the SDK's bounded receiver; builds that
+    /// do not consume certificates drop it immediately so SDK sends can never
+    /// block on an unobserved full channel.
     certificate_rx: Option<Mutex<mpsc::Receiver<VerifiedCertificateBatch>>>,
 }
 
@@ -90,9 +92,9 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
         Self::build(wallet, None, false)
     }
 
-    /// Internal server construction path. When `receive_certificates` is
-    /// `false`, this leaves the SDK certificate receiver untouched exactly as
-    /// [`PeerHandle::new`] does.
+    /// Internal server construction path. `receive_certificates` retains the
+    /// SDK certificate receiver for certificate-aware drives; otherwise the
+    /// receiver is taken and dropped during construction.
     pub(crate) fn new_for_server(
         wallet: W,
         requested: Option<RequestedCertificateSet>,
@@ -116,12 +118,10 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
         let general_rx = peer
             .on_general_message()
             .expect("on_general_message must succeed on a fresh Peer");
-        let certificate_rx = receive_certificates.then(|| {
-            Mutex::new(
-                peer.on_certificates()
-                    .expect("on_certificates must succeed on a fresh Peer"),
-            )
-        });
+        let certificate_rx = peer
+            .on_certificates()
+            .expect("on_certificates must succeed on a fresh Peer");
+        let certificate_rx = receive_certificates.then(|| Mutex::new(certificate_rx));
         Self {
             peer,
             incoming_tx,

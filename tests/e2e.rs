@@ -459,7 +459,7 @@ async fn rejected_certificate_closes_socket_before_authentication_success() {
 }
 
 #[tokio::test]
-async fn authsocket_client_provides_certificates_to_requiring_server() {
+async fn authsocket_client_completes_with_slow_accepting_certificate_authorizer() {
     let server_identity = identity_of(SERVER_KEY).await;
     let client_identity = identity_of(CLIENT_KEY).await;
     let core: SharedAuthSocketServer<ProtoWallet> = Arc::new(AuthSocketServer::new());
@@ -468,21 +468,28 @@ async fn authsocket_client_provides_certificates_to_requiring_server() {
     let authorizer_called_cb = authorizer_called.clone();
     let expected_client = client_identity.clone();
     let trusted_certifier = server_identity.clone();
+    let requested_type = CertificateType([7; 32]);
     core.set_certificate_authorizer(move |identity, certificates| {
         let called = authorizer_called_cb.clone();
         let expected_client = expected_client.clone();
         let trusted_certifier = trusted_certifier.clone();
+        let requested_type = requested_type.clone();
         async move {
             called.store(true, Ordering::SeqCst);
+            // Model a network-backed revocation lookup. The authenticated app
+            // event may arrive while this decision is still pending.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             // bsv-sdk has already authenticated `identity`, the response
             // signature/replay nonce, and each certificate's subject,
-            // signature, and requested type. Application policy still owns the
-            // certifier trust decision and a live revocation lookup.
+            // and signature. bsv-sdk 0.7.1 does not constrain certificate type
+            // on this response path, so application policy checks the requested
+            // type, certifier trust, and live revocation status here.
             let certificate = certificates.first();
             let trusted_metadata = certificates.len() == 1
                 && identity == expected_client
                 && certificate.is_some_and(|certificate| {
-                    certificate.certifier.to_der_hex() == trusted_certifier
+                    certificate.cert_type == requested_type
+                        && certificate.certifier.to_der_hex() == trusted_certifier
                         && certificate.revocation_outpoint.is_some()
                 });
             let is_revoked = match certificate.and_then(|cert| cert.revocation_outpoint.as_deref())

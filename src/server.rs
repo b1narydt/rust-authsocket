@@ -60,6 +60,7 @@ use futures_util::future::join_all;
 use parking_lot::RwLock;
 use serde_json::Value;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::peer_session::{PeerHandle, VerifiedEvent};
@@ -92,7 +93,8 @@ pub enum CertificateAuthorization {
     NotRequired,
     /// Certificates were requested and no authorization decision exists yet.
     Pending,
-    /// The configured authorizer accepted certificates from this identity.
+    /// The configured authorizer accepted certificates signed by this socket's
+    /// BRC-103 session peer.
     Accepted { identity_key: String },
     /// The configured authorizer rejected this identity.
     Rejected {
@@ -137,11 +139,19 @@ struct Connection<W: WalletInterface + 'static> {
     /// Set exclusively from a verified general-message sender — never from the
     /// unverified envelope claim.
     identity_key: RwLock<Option<String>>,
+    /// Identity recorded by the SDK for this socket's successfully processed
+    /// responder-side BRC-103 session. Certificate responses must be signed by
+    /// this same key before application authorization can accept them.
+    session_peer_identity_key: RwLock<Option<String>>,
     certificate_authorization: RwLock<CertificateAuthorization>,
     certificate_deadline: Option<Instant>,
     certificate_timeout: Option<Duration>,
-    /// Serializes the only non-terminal certificate authorization transition.
-    certificate_authorization_io: Mutex<()>,
+    /// Serializes authorization transitions with pending-event deferral. The
+    /// vector owns verified events until a pending decision becomes terminal.
+    deferred_events: Mutex<Vec<VerifiedEvent>>,
+    /// Aborted when authorization resolves or the socket disconnects, so the
+    /// deadline task does not retain the socket/server until the full timeout.
+    certificate_deadline_task: RwLock<Option<JoinHandle<()>>>,
     /// Once enabled it stays enabled, even after the last request listener is
     /// removed, so an in-flight response can never race an un-serialized drive.
     certificate_exchange_enabled: AtomicBool,
@@ -224,11 +234,12 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
     ///
     /// The authorizer receives only batches emitted by bsv-sdk 0.7.1's verified
     /// certificate channel. Before delivery, the SDK verifies the response's
-    /// nonce, active session (including idle TTL), transport signature and
+    /// nonce, active session (including idle TTL), response signature and
     /// replay nonce, then verifies each certificate's subject and certificate
-    /// signature and requires its type to have been requested. The authorizer
-    /// MUST still enforce application policy, including trusted certifiers and
-    /// current revocation status, before accepting.
+    /// signature. On this response path 0.7.1 does **not** enforce that a
+    /// certificate's type was requested, so the authorizer MUST check the type
+    /// as well as application policy such as trusted certifiers and current
+    /// revocation status before accepting.
     ///
     /// `Certificate` does not include the selective-disclosure keyring, so its
     /// field values generally remain encrypted here and cannot be passed to
@@ -286,10 +297,12 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
         let conn = Arc::new(Connection {
             handle: PeerHandle::new_for_server(wallet, requested, has_authorizer),
             identity_key: RwLock::new(None),
+            session_peer_identity_key: RwLock::new(None),
             certificate_authorization: RwLock::new(authorization),
             certificate_deadline,
             certificate_timeout: has_authorizer.then_some(authorization_timeout),
-            certificate_authorization_io: Mutex::new(()),
+            deferred_events: Mutex::new(Vec::new()),
+            certificate_deadline_task: RwLock::new(None),
             certificate_exchange_enabled: AtomicBool::new(has_authorizer || !listeners.is_empty()),
             certificate_request_bridge_id: RwLock::new(None),
         });
@@ -304,7 +317,9 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
 
     /// Drop a socket and its room memberships.
     pub fn remove_connection(&self, socket_id: &str) {
-        self.conns.write().remove(socket_id);
+        if let Some(conn) = self.conns.write().remove(socket_id) {
+            Self::abort_certificate_deadline_task(&conn);
+        }
         let mut rooms = self.rooms.write();
         for members in rooms.values_mut() {
             members.remove(socket_id);
@@ -349,7 +364,42 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
                 conn.certificate_timeout.unwrap_or_default().as_secs_f64()
             ),
         };
+        drop(authorization);
+        Self::abort_certificate_deadline_task(conn);
         true
+    }
+
+    fn abort_certificate_deadline_task(conn: &Connection<W>) {
+        if let Some(task) = conn.certificate_deadline_task.write().take() {
+            task.abort();
+        }
+    }
+
+    pub(crate) fn set_certificate_authorization_deadline_task(
+        &self,
+        socket_id: &str,
+        task: JoinHandle<()>,
+    ) {
+        let Some(conn) = self.conn(socket_id) else {
+            task.abort();
+            return;
+        };
+        if !matches!(
+            *conn.certificate_authorization.read(),
+            CertificateAuthorization::Pending
+        ) {
+            task.abort();
+            return;
+        }
+        *conn.certificate_deadline_task.write() = Some(task);
+        // Close the small race where authorization resolved after the first
+        // state check but before the handle was stored.
+        if !matches!(
+            *conn.certificate_authorization.read(),
+            CertificateAuthorization::Pending
+        ) {
+            Self::abort_certificate_deadline_task(&conn);
+        }
     }
 
     pub(crate) fn certificate_authorization_deadline(&self, socket_id: &str) -> Option<Instant> {
@@ -457,51 +507,48 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
         // Peer work outside any map lock — other sockets proceed concurrently.
         // The default-off path calls the original drive primitive directly: no
         // certificate channel allocation and no additional await/yield.
-        let certificate_response = msg.message_type == MessageType::CertificateResponse;
+        let message_type = msg.message_type.clone();
+        let message_identity_key = msg.identity_key.clone();
+        let certificate_response = message_type == MessageType::CertificateResponse;
         let (outbound, mut events) = if conn.certificate_exchange_enabled.load(Ordering::SeqCst) {
             let certificate_drive = conn.handle.drive_certificate_aware(msg).await;
+            if message_type == MessageType::InitialRequest && certificate_drive.error.is_none() {
+                let mut session_identity = conn.session_peer_identity_key.write();
+                match session_identity.as_ref() {
+                    None => *session_identity = Some(message_identity_key),
+                    Some(identity) if identity == &message_identity_key => {}
+                    Some(_) => Self::reject_pending_certificate_response(
+                        &conn,
+                        "BRC-103 session identity changed on one socket".into(),
+                    ),
+                }
+            }
             if certificate_response {
-                if let Some(error) = certificate_drive.error {
+                if let Some(error) = &certificate_drive.error {
                     Self::reject_pending_certificate_response(
                         &conn,
                         format!("bsv-sdk rejected certificateResponse: {error}"),
                     );
                 }
             }
-            // The SDK channel also covers certificates embedded in a verified
-            // initialResponse, so consume every delivered batch regardless of
-            // which authenticated protocol frame carried it.
+            let mut released_events = Vec::new();
+            // On a server peer, bsv-sdk 0.7.1 delivers this channel only from a
+            // successfully processed certificateResponse.
             for (identity_key, certificates) in certificate_drive.certificates {
-                self.authorize_verified_certificates(&conn, identity_key, certificates)
-                    .await;
+                released_events.extend(
+                    self.authorize_verified_certificates(&conn, identity_key, certificates)
+                        .await,
+                );
             }
-            (certificate_drive.outbound, certificate_drive.events)
+            let mut events = certificate_drive.events;
+            events.extend(released_events);
+            (certificate_drive.outbound, events)
         } else {
             conn.handle.drive(msg).await
         };
 
-        let authorization = conn.certificate_authorization.read().clone();
-        match &authorization {
-            CertificateAuthorization::NotRequired => {}
-            CertificateAuthorization::Accepted { identity_key } => {
-                // Bind the accepted certificate identity to every subsequent
-                // verified general event. A mismatch fails closed.
-                if events.iter().any(|event| event.sender != *identity_key) {
-                    *conn.certificate_authorization.write() = CertificateAuthorization::Rejected {
-                        identity_key: identity_key.clone(),
-                        reason: "certificate identity does not match general-message sender".into(),
-                    };
-                    events.clear();
-                }
-            }
-            CertificateAuthorization::Pending | CertificateAuthorization::Rejected { .. } => {
-                if !events.is_empty() {
-                    tracing::warn!(socket = %socket_id,
-                        "authsocket: application event suppressed before certificate authorization");
-                    events.clear();
-                }
-            }
-        }
+        self.gate_or_defer_events(socket_id, &conn, &mut events)
+            .await;
 
         for ev in &events {
             if is_valid_identity_key(&ev.sender) {
@@ -518,6 +565,56 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
                 identity_key: conn.identity_key.read().clone().unwrap_or_default(),
                 reason,
             };
+            drop(authorization);
+            Self::abort_certificate_deadline_task(conn);
+        }
+    }
+
+    async fn gate_or_defer_events(
+        &self,
+        socket_id: &str,
+        conn: &Connection<W>,
+        events: &mut Vec<VerifiedEvent>,
+    ) {
+        if events.is_empty()
+            || matches!(
+                *conn.certificate_authorization.read(),
+                CertificateAuthorization::NotRequired
+            )
+        {
+            return;
+        }
+
+        // The same mutex covers the pending queue and the authorizer's state
+        // transition. If a decision is in flight, this handler waits here and
+        // then either delivers its event after acceptance or drops it after a
+        // terminal rejection. If no decision has started yet, it deposits the
+        // events for the certificateResponse handler to release.
+        let mut deferred = conn.deferred_events.lock().await;
+        let authorization = conn.certificate_authorization.read().clone();
+        match authorization {
+            CertificateAuthorization::NotRequired => {}
+            CertificateAuthorization::Accepted { identity_key } => {
+                if events.iter().any(|event| event.sender != identity_key) {
+                    *conn.certificate_authorization.write() = CertificateAuthorization::Rejected {
+                        identity_key,
+                        reason: "certificate identity does not match general-message sender".into(),
+                    };
+                    deferred.clear();
+                    events.clear();
+                    Self::abort_certificate_deadline_task(conn);
+                }
+            }
+            CertificateAuthorization::Pending => {
+                tracing::debug!(socket = %socket_id,
+                    count = events.len(),
+                    "authsocket: application events deferred pending certificate authorization");
+                deferred.append(events);
+            }
+            CertificateAuthorization::Rejected { .. } => {
+                deferred.clear();
+                events.clear();
+            }
         }
     }
 
@@ -526,13 +623,25 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
         conn: &Arc<Connection<W>>,
         identity_key: String,
         certificates: Vec<Certificate>,
-    ) {
-        let _transition = conn.certificate_authorization_io.lock().await;
+    ) -> Vec<VerifiedEvent> {
+        let mut deferred = conn.deferred_events.lock().await;
         if !matches!(
             *conn.certificate_authorization.read(),
             CertificateAuthorization::Pending
         ) {
-            return;
+            deferred.clear();
+            return Vec::new();
+        }
+
+        if conn.session_peer_identity_key.read().as_deref() != Some(identity_key.as_str()) {
+            *conn.certificate_authorization.write() = CertificateAuthorization::Rejected {
+                identity_key,
+                reason: "certificate-response signer does not match the BRC-103 session peer"
+                    .into(),
+            };
+            deferred.clear();
+            Self::abort_certificate_deadline_task(conn);
+            return Vec::new();
         }
 
         let Some(authorizer) = self.certificate_authorizer.read().clone() else {
@@ -541,19 +650,22 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
                 "SDK-verified certificates received but no certificate authorizer is configured"
                     .into(),
             );
-            return;
+            deferred.clear();
+            return Vec::new();
         };
 
         // `identity_key` and the batch come exclusively from Peer::on_certificates,
-        // after bsv-sdk's complete certificate-response verification pipeline.
+        // after bsv-sdk authenticated the response and certificate signatures.
         let decision = authorizer(identity_key.clone(), certificates).await;
 
         // This is the sole post-await transition guard. A timeout/rejection that
         // won concurrently is terminal and cannot be revived by a late Accept.
         let mut authorization = conn.certificate_authorization.write();
         if !matches!(*authorization, CertificateAuthorization::Pending) {
-            return;
+            deferred.clear();
+            return Vec::new();
         }
+        let accepted = matches!(decision, CertificateAuthorizationDecision::Accept);
         *authorization = match decision {
             CertificateAuthorizationDecision::Accept => {
                 CertificateAuthorization::Accepted { identity_key }
@@ -565,6 +677,14 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
                 }
             }
         };
+        drop(authorization);
+        Self::abort_certificate_deadline_task(conn);
+        if accepted {
+            std::mem::take(&mut *deferred)
+        } else {
+            deferred.clear();
+            Vec::new()
+        }
     }
 
     /// This socket's verified identity key, if a verified general message has
@@ -1059,8 +1179,8 @@ mod tests {
         server.add_connection("sock1", wallet(0x11));
         let conn = server.conn("sock1").expect("default connection");
         assert!(
-            conn.handle.peer().on_certificates().is_some(),
-            "default server construction must leave the SDK certificate receiver untouched"
+            conn.handle.peer().on_certificates().is_none(),
+            "default server construction must take and drop the bounded SDK certificate receiver"
         );
         let client = test_client(0x22).await;
 
@@ -1133,6 +1253,59 @@ mod tests {
         );
         drop(certificate_io);
         send.await.expect("send task").expect("send message");
+    }
+
+    #[tokio::test]
+    async fn default_server_drains_unsolicited_verified_certificate_batches() {
+        let server_identity = identity_for_scalar(0x11).await;
+        let client = test_client(0x22).await;
+        let server = AuthSocketServer::new();
+        server.add_connection("sock1", wallet(0x11));
+        client_send(&server, "sock1", &client, "authenticated", &json!({})).await;
+        let certificate = membership_certificate(&client.identity, 0x11).await;
+
+        for response_number in 1..=33 {
+            let frame =
+                certificate_response_frame(&client, &server_identity, vec![certificate.clone()])
+                    .await;
+            tokio::time::timeout(
+                Duration::from_millis(250),
+                server.on_auth_message("sock1", frame),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("certificateResponse {response_number} wedged"));
+        }
+    }
+
+    #[tokio::test]
+    async fn late_certificate_listener_does_not_wedge_response_processing() {
+        let server_identity = identity_for_scalar(0x11).await;
+        let client = test_client(0x22).await;
+        let server = Arc::new(AuthSocketServer::new());
+        server.add_connection("sock1", wallet(0x11));
+        client_send(&server, "sock1", &client, "authenticated", &json!({})).await;
+        server.listen_for_certificates_requested(Arc::new(|_, _, _| {}));
+        let certificate = membership_certificate(&client.identity, 0x11).await;
+
+        for response_number in 1..=33 {
+            let frame =
+                certificate_response_frame(&client, &server_identity, vec![certificate.clone()])
+                    .await;
+            tokio::time::timeout(
+                Duration::from_millis(250),
+                server.on_auth_message("sock1", frame),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("certificateResponse {response_number} wedged"));
+        }
+
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            server.send_certificate_response("sock1", &client.identity, Vec::new()),
+        )
+        .await
+        .expect("a later server certificate response must not wedge")
+        .expect("the established session accepts a certificate response");
     }
 
     #[tokio::test]

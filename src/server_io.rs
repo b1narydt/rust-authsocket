@@ -106,7 +106,7 @@ pub fn attach<W, F, D>(
             let server_timeout = server.clone();
             let socket_timeout = socket.clone();
             let sid_timeout = sid.clone();
-            tokio::spawn(async move {
+            let deadline_task = tokio::spawn(async move {
                 tokio::time::sleep_until(deadline).await;
                 if server_timeout.expire_certificate_authorization(&sid_timeout) {
                     warn!(sid = %sid_timeout,
@@ -115,6 +115,7 @@ pub fn attach<W, F, D>(
                     socket_timeout.disconnect().ok();
                 }
             });
+            server.set_certificate_authorization_deadline_task(&sid, deadline_task);
         }
 
         let server_msg = server.clone();
