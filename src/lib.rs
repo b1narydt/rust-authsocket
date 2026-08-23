@@ -66,7 +66,7 @@ pub mod server_io;
 #[cfg(feature = "server")]
 pub use server::{
     AuthSocketServer, CertificateAuthorization, CertificateAuthorizationDecision,
-    OnCertificatesRequested, SharedAuthSocketServer,
+    OnCertificatesRequested, SharedAuthSocketServer, CERTIFICATE_AUTHORIZATION_TIMEOUT,
 };
 #[cfg(feature = "server")]
 pub use server_io::{

@@ -108,7 +108,9 @@ pub fn attach<W, F, D>(
             let sid_timeout = sid.clone();
             let deadline_task = tokio::spawn(async move {
                 tokio::time::sleep_until(deadline).await;
-                if server_timeout.expire_certificate_authorization(&sid_timeout) {
+                if server_timeout
+                    .expire_certificate_authorization_from_deadline(&sid_timeout)
+                {
                     warn!(sid = %sid_timeout,
                         "authsocket: certificate authorization deadline expired — closing socket");
                     server_timeout.remove_connection(&sid_timeout);
