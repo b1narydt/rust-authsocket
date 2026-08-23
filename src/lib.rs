@@ -70,4 +70,4 @@ pub use server_io::{
 #[cfg(feature = "client")]
 pub mod client;
 #[cfg(feature = "client")]
-pub use client::{AuthSocketClient, SocketIOTransport};
+pub use client::{AuthSocketClient, CertificateProvider, SocketIOTransport};

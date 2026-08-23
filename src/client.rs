@@ -42,8 +42,8 @@ use async_trait::async_trait;
 use bsv::auth::error::AuthError;
 use bsv::auth::peer::Peer;
 use bsv::auth::transports::Transport;
-use bsv::auth::types::{AuthMessage, MessageType};
-use bsv::wallet::interfaces::WalletInterface;
+use bsv::auth::types::{AuthMessage, MessageType, RequestedCertificateSet};
+use bsv::wallet::interfaces::{Certificate, WalletInterface};
 
 use crate::wire::{decode_event, encode_event, AUTH_MESSAGE_EVENT};
 
@@ -126,7 +126,20 @@ pub type EventHandler = Arc<dyn Fn(Value) + Send + Sync>;
 /// `(event_name, data)`.
 pub type FallbackHandler = Arc<dyn Fn(String, Value) + Send + Sync>;
 
+/// Async client-side certificate provider. Arguments are the authenticated
+/// verifier identity and its requested certificate set. Returning an error (or
+/// an empty batch) fails the connection with certificate-specific diagnostics.
+pub type CertificateProvider = Arc<
+    dyn Fn(
+            String,
+            RequestedCertificateSet,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<Certificate>, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
 type HandlerMap = Arc<Mutex<HashMap<String, EventHandler>>>;
+type AuthSuccessSender = Arc<Mutex<Option<oneshot::Sender<Result<(), String>>>>>;
 
 /// Type-erased BRC-103 signer.
 ///
@@ -291,6 +304,53 @@ impl AuthSocketClient {
     where
         W: WalletInterface + Send + Sync + 'static,
     {
+        Self::connect_inner(url, identity_key, wallet, None).await
+    }
+
+    /// Connect and answer certificate requests with `certificates` before the
+    /// first signed `authenticated` event is sent.
+    pub async fn connect_with_certificates<W>(
+        url: &str,
+        identity_key: &str,
+        wallet: W,
+        certificates: Vec<Certificate>,
+    ) -> Result<Self, ClientError>
+    where
+        W: WalletInterface + Send + Sync + 'static,
+    {
+        let certificates = Arc::new(certificates);
+        let provider: CertificateProvider = Arc::new(move |_, _| {
+            let certificates = certificates.clone();
+            Box::pin(async move { Ok((*certificates).clone()) })
+        });
+        Self::connect_inner(url, identity_key, wallet, Some(provider)).await
+    }
+
+    /// Connect with an async certificate provider. Unlike the SDK's automatic
+    /// wallet lookup, this path reports provider/send failures and guarantees
+    /// the response is emitted before `authenticated`, so a certificate-gated
+    /// server cannot suppress the only authentication acknowledgement trigger.
+    pub async fn connect_with_certificate_provider<W>(
+        url: &str,
+        identity_key: &str,
+        wallet: W,
+        provider: CertificateProvider,
+    ) -> Result<Self, ClientError>
+    where
+        W: WalletInterface + Send + Sync + 'static,
+    {
+        Self::connect_inner(url, identity_key, wallet, Some(provider)).await
+    }
+
+    async fn connect_inner<W>(
+        url: &str,
+        identity_key: &str,
+        wallet: W,
+        certificate_provider: Option<CertificateProvider>,
+    ) -> Result<Self, ClientError>
+    where
+        W: WalletInterface + Send + Sync + 'static,
+    {
         let handlers: HandlerMap = Arc::new(Mutex::new(HashMap::new()));
         let fallback: Arc<Mutex<Option<FallbackHandler>>> = Arc::new(Mutex::new(None));
         let joined_rooms: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -299,15 +359,15 @@ impl AuthSocketClient {
         // Read-deadline tracker: every inbound frame stamps this. Initialized
         // to "now" so the watchdog does not fire before the first frame.
         let last_inbound_ms = Arc::new(AtomicU64::new(now_ms()));
+        let certificate_requested = Arc::new(AtomicBool::new(false));
 
         // Incoming BRC-103 authMessage events → SocketIOTransport → Peer.
         let (auth_msg_tx, auth_msg_rx) = mpsc::channel(64);
         // Server identity key captured from the handshake frames.
         let (server_key_tx, mut server_key_rx) = mpsc::channel::<String>(1);
         // authenticationSuccess oneshot (fired by the dispatcher).
-        let (auth_success_tx, auth_success_rx) = oneshot::channel::<()>();
-        let auth_success_shared: Arc<Mutex<Option<oneshot::Sender<()>>>> =
-            Arc::new(Mutex::new(Some(auth_success_tx)));
+        let (auth_success_tx, auth_success_rx) = oneshot::channel::<Result<(), String>>();
+        let auth_success_shared: AuthSuccessSender = Arc::new(Mutex::new(Some(auth_success_tx)));
 
         // Raised by the Socket.IO `error` callback; consumed by the keepalive
         // task, which answers it with an IMMEDIATE probe emit. See
@@ -317,6 +377,7 @@ impl AuthSocketClient {
         let conn_clone = connected.clone();
         let conn_close_clone = connected.clone();
         let dead_close_clone = dead.clone();
+        let auth_failure_close = auth_success_shared.clone();
         let transport_error_cb = transport_error.clone();
 
         // Socket.IO connect-ack gate. `rust_socketio::connect()` sends the
@@ -331,6 +392,7 @@ impl AuthSocketClient {
         let auth_msg_tx_clone = auth_msg_tx.clone();
         let server_key_tx_clone = server_key_tx.clone();
         let last_inbound_for_auth = last_inbound_ms.clone();
+        let certificate_requested_for_auth = certificate_requested.clone();
 
         // Handlers ONLY for `authMessage` + Connect/Close lifecycle. There is
         // deliberately no raw application-event handler: every application
@@ -341,10 +403,20 @@ impl AuthSocketClient {
                 let tx = auth_msg_tx_clone.clone();
                 let key_tx = server_key_tx_clone.clone();
                 let last_inbound = last_inbound_for_auth.clone();
+                let certificate_requested = certificate_requested_for_auth.clone();
                 async move {
                     // Any inbound authMessage frame is proof of life.
                     last_inbound.store(now_ms(), Ordering::SeqCst);
                     if let Some(msg) = parse_auth_message_from_payload(&payload) {
+                        if msg
+                            .requested_certificates
+                            .as_ref()
+                            .is_some_and(|requested| {
+                                !requested.is_empty() || !requested.certifiers.is_empty()
+                            })
+                        {
+                            certificate_requested.store(true, Ordering::SeqCst);
+                        }
                         // Capture the server identity key from the handshake
                         // frames so it can be retrieved after the handshake
                         // completes (the Peer itself verifies it during
@@ -374,9 +446,14 @@ impl AuthSocketClient {
             .on(Event::Close, move |_payload, _socket| {
                 let conn = conn_close_clone.clone();
                 let dead = dead_close_clone.clone();
+                let auth_failure = auth_failure_close.clone();
                 async move {
                     dead.store(true, Ordering::SeqCst);
                     conn.store(false, Ordering::SeqCst);
+                    if let Some(tx) = auth_failure.lock().await.take() {
+                        let _ =
+                            tx.send(Err("socket closed before authenticationSuccess".to_string()));
+                    }
                 }
                 .boxed()
             })
@@ -418,6 +495,35 @@ impl AuthSocketClient {
         let transport = SocketIOTransport::new(client.clone(), auth_msg_rx);
         let peer = Arc::new(Peer::new(wallet, Arc::new(transport)));
 
+        // Provider mode takes control of the SDK callback before the handshake.
+        // The callback itself is synchronous, so async certificate retrieval and
+        // response sending run in a task and report completion through this
+        // channel. The first app event is held until that report arrives.
+        let (certificate_result_tx, mut certificate_result_rx) = mpsc::channel(1);
+        if let Some(provider) = certificate_provider.clone() {
+            let peer_for_certificates = peer.clone();
+            let requested_flag = certificate_requested.clone();
+            peer.listen_for_certificates_requested(Arc::new(move |verifier, requested| {
+                requested_flag.store(true, Ordering::SeqCst);
+                let provider = provider.clone();
+                let peer = peer_for_certificates.clone();
+                let result_tx = certificate_result_tx.clone();
+                tokio::spawn(async move {
+                    let result = match provider(verifier.clone(), requested).await {
+                        Ok(certificates) if certificates.is_empty() => {
+                            Err("certificate provider returned an empty batch".to_string())
+                        }
+                        Ok(certificates) => peer
+                            .send_certificate_response(&verifier, certificates)
+                            .await
+                            .map_err(|error| error.to_string()),
+                        Err(error) => Err(error),
+                    };
+                    let _ = result_tx.send(result).await;
+                });
+            }));
+        }
+
         // Take-once, before any task can race for it.
         let general_msg_rx = peer
             .on_general_message()
@@ -446,14 +552,56 @@ impl AuthSocketClient {
             }
         }
 
-        // Client-initiated BRC-103 handshake: send_message("") initiates the
-        // handshake (InitialRequest → poll for InitialResponse → mutual auth)
-        // and then delivers the signed `authenticated` general message. The ""
-        // identity is resolved to the server's real key during the handshake.
+        // Client-initiated BRC-103 handshake. Legacy/default mode retains the
+        // original single send_message("") path exactly. Provider mode first
+        // establishes the session, waits for any requested response to be sent,
+        // and only then sends the first `authenticated` general message.
         let auth_payload = encode_event("authenticated", &json!({ "identityKey": identity_key }));
-        if let Err(e) = peer.send_message("", auth_payload).await {
+        let handshake_result = if certificate_provider.is_some() {
+            match peer.get_authenticated_session("").await {
+                Ok(session) => {
+                    if certificate_requested.load(Ordering::SeqCst) {
+                        match tokio::time::timeout(
+                            AUTH_SUCCESS_TIMEOUT,
+                            certificate_result_rx.recv(),
+                        )
+                        .await
+                        {
+                            Ok(Some(Ok(()))) => {
+                                peer.send_message(&session.peer_identity_key, auth_payload)
+                                    .await
+                            }
+                            Ok(Some(Err(error))) => Err(AuthError::TransportError(format!(
+                                "certificate provisioning failed: {error}"
+                            ))),
+                            Ok(None) => Err(AuthError::TransportError(
+                                "certificate provider completion channel closed".into(),
+                            )),
+                            Err(_) => Err(AuthError::TransportError(format!(
+                                "certificate response was not sent within {}s",
+                                AUTH_SUCCESS_TIMEOUT.as_secs()
+                            ))),
+                        }
+                    } else {
+                        peer.send_message(&session.peer_identity_key, auth_payload)
+                            .await
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            peer.send_message("", auth_payload).await
+        };
+        if let Err(e) = handshake_result {
             abandon(client, connected, dead).await;
-            return Err(ClientError::Handshake(e.to_string()));
+            let message = if certificate_requested.load(Ordering::SeqCst) {
+                format!(
+                    "certificate provisioning failed after the server requested certificates: {e}; configure connect_with_certificates or connect_with_certificate_provider"
+                )
+            } else {
+                e.to_string()
+            };
+            return Err(ClientError::Handshake(message));
         }
 
         // The server identity key captured by the authMessage callback.
@@ -646,7 +794,7 @@ impl AuthSocketClient {
                                 connected_for_dispatch.store(true, Ordering::SeqCst);
                                 let mut guard = auth_success_shared.lock().await;
                                 if let Some(tx) = guard.take() {
-                                    let _ = tx.send(());
+                                    let _ = tx.send(Ok(()));
                                 }
                             }
                             let handler = { handlers.lock().await.get(&event_name).cloned() };
@@ -670,7 +818,18 @@ impl AuthSocketClient {
 
         // Wait for the server's signed authenticationSuccess.
         match tokio::time::timeout(AUTH_SUCCESS_TIMEOUT, auth_success_rx).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(reason))) => {
+                abandon(client, connected, dead).await;
+                let message = if certificate_requested.load(Ordering::SeqCst) {
+                    format!(
+                        "{reason}; the server requested certificates, so configure connect_with_certificates or connect_with_certificate_provider and ensure the server accepts the batch"
+                    )
+                } else {
+                    reason
+                };
+                return Err(ClientError::Handshake(message));
+            }
             Ok(Err(_)) => {
                 abandon(client, connected, dead).await;
                 return Err(ClientError::Handshake(
@@ -679,9 +838,18 @@ impl AuthSocketClient {
             }
             Err(_) => {
                 abandon(client, connected, dead).await;
-                return Err(ClientError::Handshake(
-                    "authenticationSuccess not received within 5s".into(),
-                ));
+                let message = if certificate_requested.load(Ordering::SeqCst) {
+                    format!(
+                        "authenticationSuccess not received within {}s after the server requested certificates; configure connect_with_certificates or connect_with_certificate_provider and ensure the server accepts the batch",
+                        AUTH_SUCCESS_TIMEOUT.as_secs()
+                    )
+                } else {
+                    format!(
+                        "authenticationSuccess not received within {}s",
+                        AUTH_SUCCESS_TIMEOUT.as_secs()
+                    )
+                };
+                return Err(ClientError::Handshake(message));
             }
         }
 
