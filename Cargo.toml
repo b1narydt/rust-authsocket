@@ -42,6 +42,11 @@ rust_socketio = { version = "0.6", features = ["async"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+# Test-only: bsv-sdk 0.7 changed `Certificate.fields` from HashMap to IndexMap,
+# because certificate field ORDER is part of the signed form (TS parity, ICU
+# root collation). Must stay on the same major as bsv-sdk's own `indexmap = "2"`
+# or the two IndexMaps are distinct types and the fixtures stop compiling.
+indexmap = "2"
 # End-to-end test: a real socketioxide server behind axum + the rust_socketio
 # client, over loopback (tests/e2e.rs, requires --features server,client).
 axum = "0.8"

@@ -691,6 +691,7 @@ mod tests {
     use bsv::primitives::public_key::PublicKey;
     use bsv::wallet::interfaces::{Certificate, CertificateType, SerialNumber};
     use bsv::wallet::proto_wallet::ProtoWallet;
+    use indexmap::IndexMap;
     use serde_json::json;
 
     use crate::transport::ChannelTransport;
@@ -850,7 +851,7 @@ mod tests {
             subject: PublicKey::from_string(subject).expect("subject key"),
             certifier: PublicKey::from_string(certifier).expect("certifier key"),
             revocation_outpoint: Some("00".repeat(32)),
-            fields: Some(HashMap::from([(
+            fields: Some(IndexMap::from([(
                 "membership".to_string(),
                 "relay-member".to_string(),
             )])),
