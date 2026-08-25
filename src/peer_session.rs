@@ -18,6 +18,7 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "server")]
 use bsv::auth::certificates::VerifiableCertificate;
 use bsv::auth::error::AuthError;
 use bsv::auth::peer::Peer;
@@ -27,9 +28,12 @@ use bsv::auth::types::AuthMessage;
 #[cfg(feature = "server")]
 use bsv::auth::types::RequestedCertificateSet;
 use bsv::wallet::interfaces::WalletInterface;
+#[cfg(feature = "server")]
 use parking_lot::Mutex as SyncMutex;
 use serde_json::Value;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
+#[cfg(feature = "server")]
+use tokio::sync::Mutex;
 
 use crate::transport::ChannelTransport;
 use crate::wire::encode_event;
@@ -74,9 +78,16 @@ pub struct PeerHandle<W: WalletInterface + 'static> {
     /// Push inbound `"authMessage"` frames here (Socket.IO → Peer).
     incoming_tx: mpsc::Sender<AuthMessage>,
     /// Drain Peer → Socket.IO frames here (then `emit` each as `"authMessage"`).
+    ///
+    /// Server-only: `take_pump_receivers` is the sole reader, and the client
+    /// backend drives its own `Peer` directly rather than through a pump. On a
+    /// client build these would be an allocated receiver nothing ever drains —
+    /// the transport's outbound channel held open with no consumer.
+    #[cfg(feature = "server")]
     outgoing_rx: SyncMutex<Option<mpsc::Receiver<AuthMessage>>>,
     /// Decoded, verified BRC-103 general-message payloads with their verified
-    /// sender key (app events).
+    /// sender key (app events). Server-only, for the same reason.
+    #[cfg(feature = "server")]
     general_rx: SyncMutex<Option<GeneralMessageReceiver>>,
     /// Serializes server-side certificate response production on this peer.
     #[cfg(feature = "server")]
@@ -109,7 +120,10 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
         wallet: W,
         #[cfg(feature = "server")] requested: Option<RequestedCertificateSet>,
     ) -> Self {
+        #[cfg(feature = "server")]
         let (transport, incoming_tx, outgoing_rx) = ChannelTransport::new();
+        #[cfg(not(feature = "server"))]
+        let (transport, incoming_tx, _outgoing_rx) = ChannelTransport::new();
         let transport = Arc::new(transport);
         let peer = Peer::new(wallet, transport.clone());
         #[cfg(feature = "server")]
@@ -117,9 +131,17 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
             peer.set_certificates_to_request(requested);
         }
         // Take-once: must be called on the fresh Peer before it is stored.
+        #[cfg(feature = "server")]
         let general_rx = peer
             .on_general_message()
             .expect("on_general_message must succeed on a fresh Peer");
+        // Client builds never pump, so take and drop the observer rather than
+        // leaving the SDK's bounded channel with a receiver nothing drains.
+        #[cfg(not(feature = "server"))]
+        drop(
+            peer.on_general_message()
+                .expect("on_general_message must succeed on a fresh Peer"),
+        );
         // The certificate-request observer is unused. Take and drop it so the
         // SDK's bounded observer channel can never retain stale notifications.
         drop(
@@ -141,7 +163,9 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
         Self {
             peer,
             incoming_tx,
+            #[cfg(feature = "server")]
             outgoing_rx: SyncMutex::new(Some(outgoing_rx)),
+            #[cfg(feature = "server")]
             general_rx: SyncMutex::new(Some(general_rx)),
             #[cfg(feature = "server")]
             certificate_io: Mutex::new(()),
