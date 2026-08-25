@@ -6,8 +6,8 @@
 //!
 //! - connect → [`AuthSocketServer::add_connection`] (fresh per-socket wallet
 //!   from the caller-supplied factory).
-//! - `"authMessage"` → parse → [`AuthSocketServer::on_auth_message`] → emit the
-//!   outbound frames back over the socket, handle the **generic room verbs**
+//! - `"authMessage"` → parse → feed [`AuthSocketServer::on_auth_message`]. A
+//!   per-connection pump emits outbound frames and handles **generic room verbs**
 //!   (`authenticated`, `joinRoom` — including the "a client may only join its
 //!   own room" check — and `leaveRoom`), and hand every other verified event to
 //!   the caller-supplied [`AppDispatcher`].
@@ -29,9 +29,9 @@ use socketioxide::extract::{Data, SocketRef};
 use socketioxide::SocketIo;
 use tracing::{debug, info, warn};
 
-use crate::peer_session::VerifiedEvent;
-use crate::server::{AuthSocketServer, SharedAuthSocketServer};
-use crate::wire::AUTH_MESSAGE_EVENT;
+use crate::peer_session::{PeerHandle, PeerPumpReceivers, VerifiedEvent};
+use crate::server::{AuthSocketServer, SharedAuthSocketServer, VerifiedEventSink};
+use crate::wire::{decode_event, AUTH_MESSAGE_EVENT};
 
 /// Consumer hook for verified application events the adapter does not handle
 /// itself (everything except `authenticated`/`joinRoom`/`leaveRoom`).
@@ -91,6 +91,39 @@ pub fn attach<W, F, D>(
             }
         }
 
+        let Some(receivers) = server.take_pump_receivers(&sid) else {
+            warn!(sid = %sid, "authsocket: connection pump receivers unavailable");
+            server.remove_connection(&sid);
+            socket.disconnect().ok();
+            return;
+        };
+        let weak_server = Arc::downgrade(&server);
+        let sink_io = io_handle.clone();
+        let sink_sid = sid.clone();
+        let sink_dispatcher = Arc::downgrade(&dispatcher);
+        let sink_server = weak_server.clone();
+        let sink: VerifiedEventSink = Arc::new(move |events| {
+            let io = sink_io.clone();
+            let sid = sink_sid.clone();
+            let dispatcher = sink_dispatcher.clone();
+            let server = sink_server.clone();
+            Box::pin(async move {
+                let Some(dispatcher) = dispatcher.upgrade() else {
+                    return;
+                };
+                dispatch_admitted_events(&io, &server, &sid, events, dispatcher.as_ref()).await;
+            })
+        });
+        server.set_verified_event_sink(&sid, &sink);
+        tokio::spawn(run_connection_pump(
+            io_handle.clone(),
+            weak_server,
+            sid.clone(),
+            receivers,
+            Arc::downgrade(&dispatcher),
+            sink,
+        ));
+
         // Half-configuration is a connection-time terminal error, and Pending
         // has a bounded lifetime. Close here (or from the deadline task) without
         // waiting for another inbound frame to make the outcome observable.
@@ -123,8 +156,6 @@ pub fn attach<W, F, D>(
 
         let server_msg = server.clone();
         let server_dc = server.clone();
-        let dispatcher = dispatcher.clone();
-        let io_for_msg = io_handle.clone();
 
         // --- authMessage (BRC-103 mutual auth + general message routing) ---
         //
@@ -138,8 +169,6 @@ pub fn attach<W, F, D>(
             AUTH_MESSAGE_EVENT,
             move |socket: SocketRef, Data(data): Data<Value>| {
                 let server = server_msg.clone();
-                let dispatcher = dispatcher.clone();
-                let io = io_for_msg.clone();
                 async move {
                     let sid = socket.id.to_string();
                     let incoming: AuthMessage = match serde_json::from_value(data) {
@@ -150,35 +179,7 @@ pub fn attach<W, F, D>(
                         }
                     };
 
-                    // Drive the Peer: verifies signatures, runs handshake steps.
-                    // The socket identity is recorded from the VERIFIED sender
-                    // inside on_auth_message, before events are returned.
-                    let driven = server.on_auth_message(&sid, incoming).await;
-
-                    // Handshake responses / signed replies back over this socket.
-                    for msg in driven.outbound {
-                        emit_frame(&socket, &sid, &msg);
-                    }
-
-                    // A certificate rejection is a terminal authorization
-                    // result, not an application event. Close before generic
-                    // `authenticated` handling can acknowledge the session.
-                    if let Some(authorization) = server.certificate_authorization(&sid) {
-                        if let Some(reason) = authorization.rejection_reason() {
-                            warn!(sid = %sid, reason = %reason,
-                                "authsocket: certificate authorization rejected — closing socket");
-                            server.remove_connection(&sid);
-                            socket.disconnect().ok();
-                            return;
-                        }
-                    }
-
-                    // Verified app events: generic room verbs in the adapter,
-                    // everything else to the consumer.
-                    for ev in driven.events {
-                        handle_verified_event(&io, &server, &socket, &sid, ev, dispatcher.as_ref())
-                            .await;
-                    }
+                    server.on_auth_message(&sid, incoming).await;
                 }
             },
         );
@@ -195,6 +196,118 @@ pub fn attach<W, F, D>(
             },
         );
     });
+}
+
+async fn run_connection_pump<W, D>(
+    io: SocketIo,
+    server: std::sync::Weak<AuthSocketServer<W>>,
+    sid: String,
+    mut receivers: PeerPumpReceivers,
+    dispatcher: std::sync::Weak<D>,
+    _certificate_sink: VerifiedEventSink,
+) where
+    W: WalletInterface + Send + Sync + 'static,
+    D: AppDispatcher<W> + ?Sized + 'static,
+{
+    let mut outgoing_open = true;
+    let mut general_open = true;
+    let mut dispatching: Option<
+        std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>,
+    > = None;
+    while outgoing_open || general_open || dispatching.is_some() {
+        // Connection removal drops the Peer and closes both SDK senders. Exit
+        // even if an application dispatcher is still pending; dropping that
+        // future prevents a handler from extending the pump lifetime.
+        if receivers.outgoing.is_closed() && receivers.general.is_closed() {
+            break;
+        }
+        tokio::select! {
+            message = receivers.outgoing.recv(), if outgoing_open => match message {
+                Some(message) => {
+                    let message = PeerHandle::<W>::normalize_outbound(message);
+                    let Some(server) = server.upgrade() else { break };
+                    server.record_outbound_session_peer_identity(&sid, &message).await;
+                    let socket = sid
+                        .parse()
+                        .ok()
+                        .and_then(|id| io.of("/").and_then(|ns| ns.get_socket(id)));
+                    let Some(socket) = socket else { continue };
+                    emit_frame(&socket, &sid, &message);
+                }
+                None => outgoing_open = false,
+            },
+            message = receivers.general.recv(), if general_open && dispatching.is_none() => match message {
+                Some((sender, payload)) => {
+                    let Some((event_name, data)) = decode_event(&payload) else {
+                        continue;
+                    };
+                    let Some(server_ref) = server.upgrade() else { break };
+                    let events = server_ref.admit_verified_event(
+                        &sid,
+                        VerifiedEvent { sender, event_name, data },
+                    );
+                    drop(server_ref);
+                    let Some(dispatcher) = dispatcher.upgrade() else { break };
+                    let dispatch_io = io.clone();
+                    let dispatch_server = server.clone();
+                    let dispatch_sid = sid.clone();
+                    dispatching = Some(Box::pin(async move {
+                        dispatch_admitted_events(
+                            &dispatch_io,
+                            &dispatch_server,
+                            &dispatch_sid,
+                            events,
+                            dispatcher.as_ref(),
+                        )
+                        .await;
+                    }));
+                }
+                None => general_open = false,
+            },
+            () = async {
+                dispatching
+                    .as_mut()
+                    .expect("dispatch branch is guarded")
+                    .as_mut()
+                    .await;
+            }, if dispatching.is_some() => {
+                dispatching = None;
+            },
+        }
+    }
+}
+
+async fn dispatch_admitted_events<W>(
+    io: &SocketIo,
+    server: &std::sync::Weak<AuthSocketServer<W>>,
+    sid: &str,
+    events: Vec<VerifiedEvent>,
+    dispatcher: &(impl AppDispatcher<W> + ?Sized),
+) where
+    W: WalletInterface + Send + Sync + 'static,
+{
+    let Some(server) = server.upgrade() else {
+        return;
+    };
+    let socket = sid
+        .parse()
+        .ok()
+        .and_then(|id| io.of("/").and_then(|ns| ns.get_socket(id)));
+    let Some(socket) = socket else {
+        return;
+    };
+    if let Some(authorization) = server.certificate_authorization(sid) {
+        if let Some(reason) = authorization.rejection_reason() {
+            warn!(sid = %sid, reason = %reason,
+                "authsocket: certificate authorization rejected — closing socket");
+            server.remove_connection(sid);
+            socket.disconnect().ok();
+            return;
+        }
+    }
+    for event in events {
+        handle_verified_event(io, &server, &socket, sid, event, dispatcher).await;
+    }
 }
 
 /// Route one verified event: generic room verbs here, the rest to the consumer.
@@ -349,12 +462,12 @@ where
     msgs.iter().all(|m| emit_frame(socket, &sid, m))
 }
 
-/// Send a BRC-103 certificate response on `socket_id` and emit every signed
-/// frame through the socketioxide namespace.
+/// Send a BRC-103 certificate response on `socket_id`. The connection pump
+/// emits the signed frame through the socketioxide namespace.
 ///
 /// This is the response half for callbacks registered with
 /// [`AuthSocketServer::listen_for_certificates_requested`]. It returns `false`
-/// if the connection/session is unavailable or any frame cannot be emitted.
+/// if the socket/session is unavailable or response production fails.
 pub async fn send_certificate_response<W>(
     io: &SocketIo,
     server: &AuthSocketServer<W>,
@@ -365,32 +478,25 @@ pub async fn send_certificate_response<W>(
 where
     W: WalletInterface + Send + Sync + 'static,
 {
-    let messages = match server
+    let socket_exists = socket_id
+        .parse()
+        .ok()
+        .and_then(|id| io.of("/").and_then(|namespace| namespace.get_socket(id)))
+        .is_some();
+    if !socket_exists {
+        return false;
+    }
+    match server
         .send_certificate_response(socket_id, identity_key, certificates)
         .await
     {
-        Ok(messages) => messages,
+        Ok(()) => true,
         Err(error) => {
             warn!(sid = %socket_id, error = %error,
                 "authsocket: certificate response signing failed");
-            return false;
+            false
         }
-    };
-    let socket = match socket_id.parse() {
-        Ok(id) => io.of("/").and_then(|namespace| namespace.get_socket(id)),
-        Err(error) => {
-            warn!(sid = %socket_id, error = %error,
-                "authsocket: unparseable socket id for certificate response");
-            None
-        }
-    };
-    let Some(socket) = socket else {
-        return false;
-    };
-    !messages.is_empty()
-        && messages
-            .iter()
-            .all(|message| emit_frame(&socket, socket_id, message))
+    }
 }
 
 /// Sign an app event for every authenticated member of `room_id` and emit each
@@ -449,7 +555,32 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::owns_room;
+    use super::*;
+    use bsv::primitives::private_key::PrivateKey;
+    use bsv::wallet::proto_wallet::ProtoWallet;
+
+    struct NoopDispatcher;
+
+    #[async_trait::async_trait]
+    impl AppDispatcher<ProtoWallet> for NoopDispatcher {
+        async fn dispatch(
+            &self,
+            _io: &SocketIo,
+            _server: &AuthSocketServer<ProtoWallet>,
+            _socket: &SocketRef,
+            _event: VerifiedEvent,
+        ) {
+        }
+    }
+
+    fn wallet() -> ProtoWallet {
+        ProtoWallet::new(
+            PrivateKey::from_hex(
+                "0000000000000000000000000000000000000000000000000000000000000011",
+            )
+            .expect("test key"),
+        )
+    }
 
     /// A key is 66-hex, so no real key can prefix another — but the rule must
     /// not DEPEND on that. A bare `starts_with` would admit `{key}evil`, and
@@ -485,5 +616,32 @@ mod tests {
         // starts with the empty string — which is all of them.
         assert!(!owns_room("", "anything"));
         assert!(!owns_room("", ""));
+    }
+
+    #[tokio::test]
+    async fn connection_pump_exits_after_connection_removal() {
+        let server = Arc::new(AuthSocketServer::new());
+        server.add_connection("sock1", wallet());
+        let receivers = server
+            .take_pump_receivers("sock1")
+            .expect("fresh pump receivers");
+        let (_layer, io) = SocketIo::new_layer();
+        let dispatcher = Arc::new(NoopDispatcher);
+        let sink: VerifiedEventSink = Arc::new(|_| Box::pin(async {}));
+        server.set_verified_event_sink("sock1", &sink);
+        let pump = tokio::spawn(run_connection_pump(
+            io,
+            Arc::downgrade(&server),
+            "sock1".into(),
+            receivers,
+            Arc::downgrade(&dispatcher),
+            sink,
+        ));
+
+        server.remove_connection("sock1");
+        tokio::time::timeout(std::time::Duration::from_secs(1), pump)
+            .await
+            .expect("pump must exit after connection removal")
+            .expect("pump task must not panic");
     }
 }

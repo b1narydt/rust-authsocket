@@ -46,6 +46,8 @@ pub mod wire;
 /// can name the types appearing in this crate's public API without adding a
 /// potentially divergent direct dependency.
 pub use bsv;
+#[cfg(feature = "server")]
+pub use peer_session::PeerPumpReceivers;
 pub use peer_session::{PeerHandle, VerifiedEvent};
 
 /// The client's liveness cadence, exposed so a consumer can size its own

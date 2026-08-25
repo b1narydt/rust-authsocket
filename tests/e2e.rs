@@ -164,6 +164,30 @@ async fn boot_handshake_only_server() -> String {
             &sid,
             ProtoWallet::new(PrivateKey::from_hex(SERVER_KEY).expect("server key")),
         );
+        let mut pump = core
+            .take_pump_receivers(&sid)
+            .expect("fresh connection pump receivers");
+        let pump_socket = socket.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    message = pump.outgoing.recv() => match message {
+                        Some(message) => {
+                            let message = authsocket::PeerHandle::<ProtoWallet>::normalize_outbound(message);
+                            let json = serde_json::to_value(message).expect("serialize authMessage");
+                            pump_socket.emit(AUTH_MESSAGE_EVENT, &json).expect("emit handshake response");
+                        }
+                        None => break,
+                    },
+                    message = pump.general.recv() => {
+                        if message.is_none() {
+                            break;
+                        }
+                        // Deliberately discard every verified application event.
+                    }
+                }
+            }
+        });
         let core = core.clone();
         socket.on(
             AUTH_MESSAGE_EVENT,
@@ -172,14 +196,7 @@ async fn boot_handshake_only_server() -> String {
                 async move {
                     let message: AuthMessage =
                         serde_json::from_value(data).expect("valid test authMessage");
-                    let driven = core.on_auth_message(&socket.id.to_string(), message).await;
-                    for outbound in driven.outbound {
-                        let json = serde_json::to_value(outbound).expect("serialize authMessage");
-                        socket
-                            .emit(AUTH_MESSAGE_EVENT, &json)
-                            .expect("emit handshake response");
-                    }
-                    // Deliberately do not dispatch driven.events.
+                    core.on_auth_message(&socket.id.to_string(), message).await;
                 }
             },
         );
