@@ -19,15 +19,18 @@
 //! BRC-103 general message; there are NO raw Socket.IO application events in
 //! either direction (a raw event would be an authentication-bypass surface).
 
+use std::any::Any;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use bsv::auth::certificates::VerifiableCertificate;
 use bsv::auth::types::AuthMessage;
 use bsv::wallet::interfaces::WalletInterface;
+use futures_util::FutureExt;
 use serde_json::Value;
 use socketioxide::extract::{Data, SocketRef};
 use socketioxide::SocketIo;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::peer_session::{PeerPumpReceivers, VerifiedEvent};
 use crate::server::{AuthSocketServer, SharedAuthSocketServer, VerifiedEventSink};
@@ -109,9 +112,25 @@ pub fn attach<W, F, D>(
             let server = sink_server.clone();
             Box::pin(async move {
                 let Some(dispatcher) = dispatcher.upgrade() else {
+                    error!(sid = %sid, count = events.len(),
+                        "authsocket: verified events dropped because dispatcher is unavailable");
                     return;
                 };
-                dispatch_admitted_events(&io, &server, &sid, events, dispatcher.as_ref()).await;
+                let dispatch = dispatch_admitted_events(
+                    &io,
+                    &server,
+                    &sid,
+                    events,
+                    dispatcher.as_ref(),
+                );
+                if let Err(payload) = AssertUnwindSafe(dispatch).catch_unwind().await {
+                    error!(sid = %sid, panic = %panic_message(payload.as_ref()),
+                        "authsocket: verified-event dispatcher panicked — closing connection");
+                    if let Some(server) = server.upgrade() {
+                        server.remove_connection(&sid);
+                    }
+                    disconnect_socket(&io, &sid);
+                }
             })
         });
         server.set_verified_event_sink(&sid, &sink);
@@ -210,28 +229,69 @@ async fn run_connection_pump<W, D>(
     D: AppDispatcher<W> + ?Sized + 'static,
 {
     let Some(server) = server.upgrade() else {
+        warn!(sid = %sid, "authsocket: connection pump lost its server — closing socket");
+        disconnect_socket(&io, &sid);
         return;
     };
     let emit_io = io.clone();
     let emit_sid = sid.clone();
-    if let Err(error) = server
-        .run_connection_pump(&sid, receivers, move |message| {
-            let io = emit_io.clone();
-            let sid = emit_sid.clone();
-            async move {
-                let socket = sid
-                    .parse()
-                    .ok()
-                    .and_then(|id| io.of("/").and_then(|ns| ns.get_socket(id)));
-                if let Some(socket) = socket {
-                    emit_frame(&socket, &sid, &message);
-                }
+    let pump = server.run_connection_pump(&sid, receivers, move |message| {
+        let io = emit_io.clone();
+        let sid = emit_sid.clone();
+        async move {
+            let socket = sid
+                .parse()
+                .ok()
+                .and_then(|id| io.of("/").and_then(|ns| ns.get_socket(id)));
+            if let Some(socket) = socket {
+                emit_frame(&socket, &sid, &message);
+            } else {
+                warn!(sid = %sid,
+                    "authsocket: outbound signed frame dropped because socket lookup failed");
             }
-        })
-        .await
-    {
-        warn!(sid = %sid, error = %error, "authsocket: connection pump stopped");
+        }
+    });
+    match AssertUnwindSafe(pump).catch_unwind().await {
+        Ok(Ok(())) => {
+            debug!(sid = %sid, "authsocket: connection pump exited");
+        }
+        Ok(Err(error)) => {
+            warn!(sid = %sid, error = %error, "authsocket: connection pump stopped");
+        }
+        Err(payload) => {
+            error!(sid = %sid, panic = %panic_message(payload.as_ref()),
+                "authsocket: connection pump panicked — closing connection");
+        }
     }
+
+    // No pump exit may leave an inert connection registered as live. This is
+    // intentionally idempotent with both the disconnect callback and the
+    // dispatcher-panic cleanup above.
+    server.remove_connection(&sid);
+    disconnect_socket(&io, &sid);
+}
+
+fn disconnect_socket(io: &SocketIo, sid: &str) {
+    let socket = sid
+        .parse()
+        .ok()
+        .and_then(|id| io.of("/").and_then(|namespace| namespace.get_socket(id)));
+    if let Some(socket) = socket {
+        if let Err(error) = socket.disconnect() {
+            warn!(sid = %sid, error = %error,
+                "authsocket: failed to disconnect socket during pump teardown");
+        }
+    } else {
+        debug!(sid = %sid, "authsocket: pump teardown found socket already absent");
+    }
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
 }
 
 async fn dispatch_admitted_events<W>(
@@ -244,6 +304,8 @@ async fn dispatch_admitted_events<W>(
     W: WalletInterface + Send + Sync + 'static,
 {
     let Some(server) = server.upgrade() else {
+        error!(sid = %sid, count = events.len(),
+            "authsocket: admitted events dropped because server is unavailable");
         return;
     };
     let socket = sid
@@ -251,6 +313,8 @@ async fn dispatch_admitted_events<W>(
         .ok()
         .and_then(|id| io.of("/").and_then(|ns| ns.get_socket(id)));
     let Some(socket) = socket else {
+        warn!(sid = %sid, count = events.len(),
+            "authsocket: admitted events dropped because socket lookup failed");
         return;
     };
     if let Some(authorization) = server.certificate_authorization(sid) {

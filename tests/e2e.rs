@@ -65,6 +65,52 @@ struct TestDispatcher {
     seen: mpsc::UnboundedSender<VerifiedEvent>,
 }
 
+struct PanickingDispatcher {
+    invoked: mpsc::UnboundedSender<String>,
+}
+
+#[async_trait::async_trait]
+impl AppDispatcher<ProtoWallet> for PanickingDispatcher {
+    async fn dispatch(
+        &self,
+        _io: &SocketIo,
+        _server: &AuthSocketServer<ProtoWallet>,
+        socket: &SocketRef,
+        _event: VerifiedEvent,
+    ) {
+        let _ = self.invoked.send(socket.id.to_string());
+        panic!("intentional dispatcher panic");
+    }
+}
+
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log buffer").extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLogs {
+    type Writer = Self;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl CapturedLogs {
+    fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().expect("log buffer").clone()).expect("UTF-8 tracing output")
+    }
+}
+
 #[async_trait::async_trait]
 impl AppDispatcher<ProtoWallet> for TestDispatcher {
     async fn dispatch(
@@ -174,6 +220,11 @@ async fn boot_handshake_only_server() -> String {
                     message = pump.outgoing.recv() => match message {
                         Some(message) => {
                             let message = authsocket::PeerHandle::<ProtoWallet>::normalize_outbound(message);
+                            // This deliberately certificate-free legacy harness
+                            // never authorizes a certificate response, so it has
+                            // no certificate signer to bind to the session. Real
+                            // consumers must use `AuthSocketServer::run_connection_pump`,
+                            // which performs that bookkeeping before every emit.
                             let json = serde_json::to_value(message).expect("serialize authMessage");
                             pump_socket.emit(AUTH_MESSAGE_EVENT, &json).expect("emit handshake response");
                         }
@@ -700,6 +751,73 @@ async fn authsocket_client_does_not_wedge_on_33rd_certificate_response() {
     assert_eq!(processed, json!({ "processed": 33 }));
 
     client.disconnect().await.expect("disconnect");
+}
+
+#[tokio::test]
+async fn panicking_dispatcher_tears_down_connection_and_is_visible_in_logs() {
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_target(false)
+        .with_writer(logs.clone())
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+
+    let core: SharedAuthSocketServer<ProtoWallet> = Arc::new(AuthSocketServer::new());
+    let (layer, io) = SocketIo::new_layer();
+    let (invoked_tx, mut invoked_rx) = mpsc::unbounded_channel();
+    attach(
+        &io,
+        core.clone(),
+        || {
+            Ok(ProtoWallet::new(
+                PrivateKey::from_hex(SERVER_KEY).expect("server key"),
+            ))
+        },
+        Arc::new(PanickingDispatcher {
+            invoked: invoked_tx,
+        }),
+    );
+    let app = axum::Router::new().layer(layer);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+
+    let client_identity = identity_of(CLIENT_KEY).await;
+    let wallet = ProtoWallet::new(PrivateKey::from_hex(CLIENT_KEY).expect("client key"));
+    let client = AuthSocketClient::connect(&format!("http://{addr}"), &client_identity, wallet)
+        .await
+        .expect("connect + handshake");
+    client
+        .emit("panicDispatcher", &json!({ "trigger": true }))
+        .await
+        .expect("queue dispatcher-triggering event");
+    let sid = tokio::time::timeout(std::time::Duration::from_secs(5), invoked_rx.recv())
+        .await
+        .expect("dispatcher invocation timeout")
+        .expect("dispatcher invocation channel");
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if core.certificate_authorization(&sid).is_none() && !client.is_connected() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("dispatcher panic must tear down both the core connection and live socket");
+    assert!(
+        logs.contents()
+            .contains("authsocket: verified-event dispatcher panicked — closing connection"),
+        "dispatcher panic teardown must be visible in tracing output; logs={}",
+        logs.contents()
+    );
 }
 
 #[tokio::test]

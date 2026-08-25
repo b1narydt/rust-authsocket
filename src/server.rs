@@ -272,6 +272,29 @@ struct Connection<W: WalletInterface + 'static> {
     test_pump: tokio::sync::Mutex<Option<TestPumpState>>,
 }
 
+struct CertificateAuthorizerInFlightGuard<W: WalletInterface + 'static> {
+    conn: Weak<Connection<W>>,
+}
+
+impl<W: WalletInterface + 'static> CertificateAuthorizerInFlightGuard<W> {
+    fn new(conn: &Arc<Connection<W>>) -> Self {
+        Self {
+            conn: Arc::downgrade(conn),
+        }
+    }
+}
+
+impl<W: WalletInterface + 'static> Drop for CertificateAuthorizerInFlightGuard<W> {
+    fn drop(&mut self) {
+        // Invariant: no cancellation of the authorizer, from any cause, may
+        // leave `certificate_authorizer_in_flight` set.
+        if let Some(conn) = self.conn.upgrade() {
+            conn.certificate_authorizer_in_flight
+                .store(false, Ordering::SeqCst);
+        }
+    }
+}
+
 #[cfg(test)]
 struct TestPumpState {
     receivers: PeerPumpReceivers,
@@ -487,26 +510,31 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
                 let weak_conn = weak_conn.clone();
                 let authorizer = authorizer.clone();
                 Box::pin(async move {
-                    let events = Self::authorize_verified_certificates_with(
-                        weak_conn.clone(),
-                        authorizer,
-                        identity_key,
-                        certificates,
-                    )
-                    .await;
-                    let Some(conn) = weak_conn.upgrade() else {
-                        return Ok(());
-                    };
-                    let sink = Self::registered_verified_event_sink(&conn);
-                    drop(conn);
-                    if let Some(sink) = sink {
-                        sink(events).await;
-                    } else {
-                        tracing::error!(
-                            count = events.len(),
-                            "authsocket: admitted certificate-gated events have no registered sink"
-                        );
-                    }
+                    // The SDK awaits this callback under its own short listener
+                    // deadline. Policy may legitimately run for minutes, so the
+                    // callback only transfers ownership to a detached task.
+                    let _authorization_task = tokio::spawn(async move {
+                        let events = Self::authorize_verified_certificates_with(
+                            weak_conn.clone(),
+                            authorizer,
+                            identity_key,
+                            certificates,
+                        )
+                        .await;
+                        let Some(conn) = weak_conn.upgrade() else {
+                            return;
+                        };
+                        let sink = Self::registered_verified_event_sink(&conn);
+                        drop(conn);
+                        if let Some(sink) = sink {
+                            sink(events).await;
+                        } else {
+                            tracing::error!(
+                                count = events.len(),
+                                "authsocket: admitted certificate-gated events have no registered sink"
+                            );
+                        }
+                    });
                     Ok(())
                 })
             },
@@ -718,9 +746,12 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
 
     /// Take the SDK observer channels for this connection exactly once.
     ///
-    /// Pass the receivers to [`Self::run_connection_pump`]. Draining `general`
-    /// directly exposes verified but not yet certificate-admitted payloads and
-    /// therefore is not a substitute for the pump's event sink.
+    /// After [`Self::add_connection`], taking these receivers and continuously
+    /// running [`Self::run_connection_pump`] is mandatory. If no pump drains
+    /// them, the bounded outbound channel fills after 32 queued frames and SDK
+    /// sends wait indefinitely while the connection appears live. Draining
+    /// `general` directly exposes verified but not yet certificate-admitted
+    /// payloads and therefore is not a substitute for the pump's event sink.
     pub fn take_pump_receivers(&self, socket_id: &str) -> Option<PeerPumpReceivers> {
         self.conn(socket_id)?.handle.take_pump_receivers()
     }
@@ -1074,6 +1105,7 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
                 return Vec::new();
             }
         }
+        let _in_flight = CertificateAuthorizerInFlightGuard::new(&conn);
 
         let Some(authorizer) = authorizer else {
             Self::reject_pending_certificate_response(
@@ -2410,6 +2442,128 @@ mod tests {
             server.certificate_authorization("sock1"),
             Some(CertificateAuthorization::Accepted { .. })
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn authorizer_outlives_sdk_listener_timeout_and_still_reaches_a_decision() {
+        let server_identity = identity_for_scalar(0x11).await;
+        let client = test_client(0x22).await;
+        client
+            .peer
+            .listen_for_certificates_requested(Arc::new(|_, _| {}));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let started_cb = started.clone();
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let invocations_cb = invocations.clone();
+        let server = AuthSocketServer::new();
+        server.set_certificate_authorization_timeout(Duration::from_secs(60));
+        server.set_certificates_to_request(requested_certificates(server_identity.clone()));
+        server.set_certificate_authorizer(move |_, _| {
+            let started = started_cb.clone();
+            let invocations = invocations_cb.clone();
+            async move {
+                invocations.fetch_add(1, Ordering::SeqCst);
+                started.notify_one();
+                // Deliberately exceed bsv-sdk's 30-second certificate-listener
+                // cap while remaining inside this crate's configured deadline.
+                tokio::time::sleep(Duration::from_secs(31)).await;
+                CertificateAuthorizationDecision::Accept
+            }
+        });
+        server.add_connection("sock1", wallet(0x11));
+        client_send(&server, "sock1", &client, "authenticated", &json!({})).await;
+        let certificate = membership_certificate(0x22, 0x11, &server_identity).await;
+        let first =
+            certificate_response_frame(&client, &server_identity, vec![certificate.clone()]).await;
+        server.on_auth_message("sock1", first).await;
+        started.notified().await;
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            server.certificate_authorization("sock1"),
+            Some(CertificateAuthorization::Pending),
+            "the crate's 60-second policy deadline, not the SDK listener cap, owns the decision"
+        );
+
+        // A retry arriving after the SDK listener budget must not expose a
+        // permanently stuck in-flight latch. The original long lookup may
+        // still own the single-flight claim and must reach its terminal result.
+        let retry = certificate_response_frame(&client, &server_identity, vec![certificate]).await;
+        server.on_auth_message("sock1", retry).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            matches!(
+                server.certificate_authorization("sock1"),
+                Some(CertificateAuthorization::Accepted { .. })
+            ),
+            "long authorizer must reach its terminal decision"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "a retry must not start a concurrent policy lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_authorizer_releases_single_flight_latch_for_retry() {
+        let server_identity = identity_for_scalar(0x11).await;
+        let client = test_client(0x22).await;
+        client
+            .peer
+            .listen_for_certificates_requested(Arc::new(|_, _| {}));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let started_cb = started.clone();
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let invocations_cb = invocations.clone();
+        let server = Arc::new(AuthSocketServer::new());
+        server.set_certificate_authorizer(move |_, _| {
+            let started = started_cb.clone();
+            let invocation = invocations_cb.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if invocation == 0 {
+                    started.notify_one();
+                    std::future::pending::<CertificateAuthorizationDecision>().await
+                } else {
+                    CertificateAuthorizationDecision::Accept
+                }
+            }
+        });
+        server.add_connection("sock1", wallet(0x11));
+        client_send(&server, "sock1", &client, "authenticated", &json!({})).await;
+        let conn = server.conn("sock1").expect("pending connection");
+        let identity = client.identity.clone();
+        let server_drive = server.clone();
+        let conn_drive = conn.clone();
+        let first = tokio::spawn(async move {
+            server_drive
+                .authorize_verified_certificates(&conn_drive, identity, Vec::new())
+                .await
+        });
+        started.notified().await;
+        first.abort();
+        assert!(first
+            .await
+            .expect_err("first authorizer is cancelled")
+            .is_cancelled());
+
+        let retry = certificate_response_frame(&client, &server_identity, Vec::new()).await;
+        server.on_auth_message("sock1", retry).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !matches!(
+                server.certificate_authorization("sock1"),
+                Some(CertificateAuthorization::Accepted { .. })
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a subsequent certificateResponse must invoke the authorizer");
+        assert_eq!(invocations.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test(start_paused = true)]
