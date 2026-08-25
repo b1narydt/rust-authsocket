@@ -136,11 +136,47 @@ type CertificateAuthorizerFuture =
     Pin<Box<dyn Future<Output = CertificateAuthorizationDecision> + Send + 'static>>;
 type CertificateAuthorizer =
     Arc<dyn Fn(String, Vec<VerifiableCertificate>) -> CertificateAuthorizerFuture + Send + Sync>;
-type VerifiedEventSinkFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
-pub(crate) type VerifiedEventSink =
+/// Future returned by a [`VerifiedEventSink`].
+pub type VerifiedEventSinkFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+/// Async consumer for application events admitted by the certificate gate.
+///
+/// Register one with [`AuthSocketServer::set_verified_event_sink`] before
+/// starting [`AuthSocketServer::run_connection_pump`]. The connection keeps a
+/// strong clone of the sink until it is removed, so the caller may drop its
+/// own [`Arc`] without stopping delivery. Both events admitted immediately and
+/// events released after certificate authorization use this same sink. A
+/// terminal certificate transition may invoke the sink with an empty batch so
+/// an adapter can observe rejection and close its transport.
+pub type VerifiedEventSink =
     Arc<dyn Fn(Vec<VerifiedEvent>) -> VerifiedEventSinkFuture + Send + Sync>;
 type WeakVerifiedEventSink =
     Weak<dyn Fn(Vec<VerifiedEvent>) -> VerifiedEventSinkFuture + Send + Sync>;
+
+/// A transport-agnostic connection pump could not be started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionPumpError {
+    /// The socket id no longer names a registered connection.
+    ConnectionUnavailable(String),
+    /// No admitted-event consumer was registered for the connection.
+    VerifiedEventSinkNotRegistered(String),
+}
+
+impl std::fmt::Display for ConnectionPumpError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConnectionUnavailable(socket_id) => {
+                write!(formatter, "connection is unavailable: {socket_id}")
+            }
+            Self::VerifiedEventSinkNotRegistered(socket_id) => write!(
+                formatter,
+                "verified-event sink is not registered for connection: {socket_id}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConnectionPumpError {}
 
 #[derive(Default)]
 struct DeferredEvents {
@@ -225,6 +261,10 @@ struct Connection<W: WalletInterface + 'static> {
     /// Installed by the socket adapter. The awaited SDK certificate listener
     /// uses it to dispatch state-released events without retaining the server.
     verified_event_sink: RwLock<Option<WeakVerifiedEventSink>>,
+    /// Public registration owns the sink for the connection lifetime. Keeping
+    /// this separate from the weak callback reference also lets internal test
+    /// pumps retain their deliberately scoped sink ownership.
+    owned_verified_event_sink: RwLock<Option<VerifiedEventSink>>,
     /// The SDK defers general dispatch until this connection's requested
     /// certificates validate.
     sdk_certificate_gate: bool,
@@ -436,6 +476,7 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
             certificate_deadline_task: RwLock::new(None),
             certificate_request_bridge_id: RwLock::new(None),
             verified_event_sink: RwLock::new(None),
+            owned_verified_event_sink: RwLock::new(None),
             sdk_certificate_gate,
             #[cfg(test)]
             test_pump: tokio::sync::Mutex::new(None),
@@ -456,14 +497,15 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
                     let Some(conn) = weak_conn.upgrade() else {
                         return Ok(());
                     };
-                    let sink = conn
-                        .verified_event_sink
-                        .read()
-                        .as_ref()
-                        .and_then(Weak::upgrade);
+                    let sink = Self::registered_verified_event_sink(&conn);
                     drop(conn);
                     if let Some(sink) = sink {
                         sink(events).await;
+                    } else {
+                        tracing::error!(
+                            count = events.len(),
+                            "authsocket: admitted certificate-gated events have no registered sink"
+                        );
                     }
                     Ok(())
                 })
@@ -674,14 +716,131 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
         conn.handle.feed(msg).await;
     }
 
+    /// Take the SDK observer channels for this connection exactly once.
+    ///
+    /// Pass the receivers to [`Self::run_connection_pump`]. Draining `general`
+    /// directly exposes verified but not yet certificate-admitted payloads and
+    /// therefore is not a substitute for the pump's event sink.
     pub fn take_pump_receivers(&self, socket_id: &str) -> Option<PeerPumpReceivers> {
         self.conn(socket_id)?.handle.take_pump_receivers()
     }
 
-    pub(crate) fn set_verified_event_sink(&self, socket_id: &str, sink: &VerifiedEventSink) {
+    /// Register the admitted-event consumer for a connection.
+    ///
+    /// The connection strongly owns a clone until [`Self::remove_connection`],
+    /// so dropping the caller's [`Arc`] does not silently stop event delivery.
+    /// Register before feeding inbound frames and before starting
+    /// [`Self::run_connection_pump`]. A missing connection is logged as an
+    /// error; the pump independently refuses to start without a registered
+    /// sink.
+    pub fn set_verified_event_sink(&self, socket_id: &str, sink: &VerifiedEventSink) {
         if let Some(conn) = self.conn(socket_id) {
             *conn.verified_event_sink.write() = Some(Arc::downgrade(sink));
+            *conn.owned_verified_event_sink.write() = Some(sink.clone());
+        } else {
+            tracing::error!(socket = %socket_id,
+                "authsocket: cannot register verified-event sink for missing connection");
         }
+    }
+
+    fn registered_verified_event_sink(conn: &Connection<W>) -> Option<VerifiedEventSink> {
+        conn.owned_verified_event_sink.read().clone().or_else(|| {
+            conn.verified_event_sink
+                .read()
+                .as_ref()
+                .and_then(Weak::upgrade)
+        })
+    }
+
+    /// Run both halves of a connection's SDK observer pump without assuming a
+    /// transport implementation.
+    ///
+    /// `emit` receives each wire-ready [`AuthMessage`] after outbound
+    /// normalization and session bookkeeping. SDK-verified general messages
+    /// are decoded and passed through the certificate gate; only admitted
+    /// [`VerifiedEvent`] batches reach the sink registered with
+    /// [`Self::set_verified_event_sink`]. Deferred events released by a later
+    /// certificate decision reach that same sink.
+    ///
+    /// The pump returns [`ConnectionPumpError::VerifiedEventSinkNotRegistered`]
+    /// before draining either receiver when no sink is registered. Removing
+    /// the connection closes the SDK senders and ends the pump successfully.
+    pub async fn run_connection_pump<F, Fut>(
+        &self,
+        socket_id: &str,
+        mut receivers: PeerPumpReceivers,
+        emit: F,
+    ) -> Result<(), ConnectionPumpError>
+    where
+        W: Send + Sync,
+        F: Fn(AuthMessage) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let conn = self
+            .conn(socket_id)
+            .ok_or_else(|| ConnectionPumpError::ConnectionUnavailable(socket_id.to_string()))?;
+        let event_sink = Self::registered_verified_event_sink(&conn).ok_or_else(|| {
+            ConnectionPumpError::VerifiedEventSinkNotRegistered(socket_id.to_string())
+        })?;
+        drop(conn);
+
+        let mut outgoing_open = true;
+        let mut general_open = true;
+        let mut emitting: Option<Pin<Box<Fut>>> = None;
+        let mut dispatching: Option<VerifiedEventSinkFuture> = None;
+        while outgoing_open || general_open || emitting.is_some() || dispatching.is_some() {
+            if receivers.outgoing.is_closed() && receivers.general.is_closed() {
+                break;
+            }
+            tokio::select! {
+                message = receivers.outgoing.recv(), if outgoing_open && emitting.is_none() => {
+                    match message {
+                        Some(message) => {
+                            let message = PeerHandle::<W>::normalize_outbound(message);
+                            self.record_outbound_session_peer_identity(socket_id, &message).await;
+                            emitting = Some(Box::pin(emit(message)));
+                        }
+                        None => outgoing_open = false,
+                    }
+                }
+                message = receivers.general.recv(), if general_open && dispatching.is_none() => {
+                    match message {
+                        Some((sender, payload)) => {
+                            let Some((event_name, data)) = crate::wire::decode_event(&payload) else {
+                                continue;
+                            };
+                            let events = self.admit_verified_event(
+                                socket_id,
+                                VerifiedEvent { sender, event_name, data },
+                            );
+                            if !events.is_empty() {
+                                dispatching = Some(event_sink(events));
+                            }
+                        }
+                        None => general_open = false,
+                    }
+                }
+                () = async {
+                    emitting
+                        .as_mut()
+                        .expect("emit branch is guarded")
+                        .as_mut()
+                        .await;
+                }, if emitting.is_some() => {
+                    emitting = None;
+                }
+                () = async {
+                    dispatching
+                        .as_mut()
+                        .expect("dispatch branch is guarded")
+                        .as_mut()
+                        .await;
+                }, if dispatching.is_some() => {
+                    dispatching = None;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Bind an emitted responder handshake to the identity held by the SDK

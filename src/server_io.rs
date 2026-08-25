@@ -29,9 +29,9 @@ use socketioxide::extract::{Data, SocketRef};
 use socketioxide::SocketIo;
 use tracing::{debug, info, warn};
 
-use crate::peer_session::{PeerHandle, PeerPumpReceivers, VerifiedEvent};
+use crate::peer_session::{PeerPumpReceivers, VerifiedEvent};
 use crate::server::{AuthSocketServer, SharedAuthSocketServer, VerifiedEventSink};
-use crate::wire::{decode_event, AUTH_MESSAGE_EVENT};
+use crate::wire::AUTH_MESSAGE_EVENT;
 
 /// Consumer hook for verified application events the adapter does not handle
 /// itself (everything except `authenticated`/`joinRoom`/`leaveRoom`).
@@ -202,78 +202,35 @@ async fn run_connection_pump<W, D>(
     io: SocketIo,
     server: std::sync::Weak<AuthSocketServer<W>>,
     sid: String,
-    mut receivers: PeerPumpReceivers,
-    dispatcher: std::sync::Weak<D>,
+    receivers: PeerPumpReceivers,
+    _dispatcher: std::sync::Weak<D>,
     _certificate_sink: VerifiedEventSink,
 ) where
     W: WalletInterface + Send + Sync + 'static,
     D: AppDispatcher<W> + ?Sized + 'static,
 {
-    let mut outgoing_open = true;
-    let mut general_open = true;
-    let mut dispatching: Option<
-        std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>,
-    > = None;
-    while outgoing_open || general_open || dispatching.is_some() {
-        // Connection removal drops the Peer and closes both SDK senders. Exit
-        // even if an application dispatcher is still pending; dropping that
-        // future prevents a handler from extending the pump lifetime.
-        if receivers.outgoing.is_closed() && receivers.general.is_closed() {
-            break;
-        }
-        tokio::select! {
-            message = receivers.outgoing.recv(), if outgoing_open => match message {
-                Some(message) => {
-                    let message = PeerHandle::<W>::normalize_outbound(message);
-                    let Some(server) = server.upgrade() else { break };
-                    server.record_outbound_session_peer_identity(&sid, &message).await;
-                    let socket = sid
-                        .parse()
-                        .ok()
-                        .and_then(|id| io.of("/").and_then(|ns| ns.get_socket(id)));
-                    let Some(socket) = socket else { continue };
+    let Some(server) = server.upgrade() else {
+        return;
+    };
+    let emit_io = io.clone();
+    let emit_sid = sid.clone();
+    if let Err(error) = server
+        .run_connection_pump(&sid, receivers, move |message| {
+            let io = emit_io.clone();
+            let sid = emit_sid.clone();
+            async move {
+                let socket = sid
+                    .parse()
+                    .ok()
+                    .and_then(|id| io.of("/").and_then(|ns| ns.get_socket(id)));
+                if let Some(socket) = socket {
                     emit_frame(&socket, &sid, &message);
                 }
-                None => outgoing_open = false,
-            },
-            message = receivers.general.recv(), if general_open && dispatching.is_none() => match message {
-                Some((sender, payload)) => {
-                    let Some((event_name, data)) = decode_event(&payload) else {
-                        continue;
-                    };
-                    let Some(server_ref) = server.upgrade() else { break };
-                    let events = server_ref.admit_verified_event(
-                        &sid,
-                        VerifiedEvent { sender, event_name, data },
-                    );
-                    drop(server_ref);
-                    let Some(dispatcher) = dispatcher.upgrade() else { break };
-                    let dispatch_io = io.clone();
-                    let dispatch_server = server.clone();
-                    let dispatch_sid = sid.clone();
-                    dispatching = Some(Box::pin(async move {
-                        dispatch_admitted_events(
-                            &dispatch_io,
-                            &dispatch_server,
-                            &dispatch_sid,
-                            events,
-                            dispatcher.as_ref(),
-                        )
-                        .await;
-                    }));
-                }
-                None => general_open = false,
-            },
-            () = async {
-                dispatching
-                    .as_mut()
-                    .expect("dispatch branch is guarded")
-                    .as_mut()
-                    .await;
-            }, if dispatching.is_some() => {
-                dispatching = None;
-            },
-        }
+            }
+        })
+        .await
+    {
+        warn!(sid = %sid, error = %error, "authsocket: connection pump stopped");
     }
 }
 
@@ -466,8 +423,10 @@ where
 /// emits the signed frame through the socketioxide namespace.
 ///
 /// This is the response half for callbacks registered with
-/// [`AuthSocketServer::listen_for_certificates_requested`]. It returns `false`
-/// if the socket/session is unavailable or response production fails.
+/// [`AuthSocketServer::listen_for_certificates_requested`]. It returns `true`
+/// when the socket exists and the SDK queues a signed response for an existing
+/// authenticated session. Actual socket emission happens asynchronously in the
+/// connection pump, so this return value does not confirm wire delivery.
 pub async fn send_certificate_response<W>(
     io: &SocketIo,
     server: &AuthSocketServer<W>,
