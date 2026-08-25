@@ -25,14 +25,13 @@ use authsocket::server_io::{
 };
 use authsocket::{wire::decode_event, wire::encode_event, AUTH_MESSAGE_EVENT};
 
-use bsv::auth::certificates::AuthCertificate;
+use bsv::auth::certificates::master::default_get_revocation_outpoint;
+use bsv::auth::certificates::{MasterCertificate, VerifiableCertificate};
 use bsv::auth::peer::Peer;
 use bsv::auth::types::{AuthMessage, MessageType, RequestedCertificateSet};
 use bsv::primitives::private_key::PrivateKey;
 use bsv::primitives::public_key::PublicKey;
-use bsv::wallet::interfaces::{
-    Certificate, CertificateType, GetPublicKeyArgs, SerialNumber, WalletInterface,
-};
+use bsv::wallet::interfaces::{CertificateType, GetPublicKeyArgs, SerialNumber, WalletInterface};
 use bsv::wallet::proto_wallet::ProtoWallet;
 
 const SERVER_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000011";
@@ -77,8 +76,8 @@ impl AppDispatcher<ProtoWallet> for TestDispatcher {
     ) {
         let _ = self.seen.send(event.clone());
         if event.event_name == "certificateFlood" {
-            let server_identity = identity_of(SERVER_KEY).await;
-            let certificate = membership_certificate(&server_identity, CERTIFIER_KEY).await;
+            let certificate =
+                membership_certificate(SERVER_KEY, CERTIFIER_KEY, &event.sender).await;
             let sid = socket.id.to_string();
             for _ in 0..33 {
                 if !send_certificate_response(
@@ -209,23 +208,38 @@ fn membership_request(certifier: String) -> RequestedCertificateSet {
     requested
 }
 
-async fn membership_certificate(subject: &str, certifier_key: &str) -> Certificate {
+async fn membership_certificate(
+    subject_key: &str,
+    certifier_key: &str,
+    verifier: &str,
+) -> VerifiableCertificate {
+    let subject_wallet = ProtoWallet::new(PrivateKey::from_hex(subject_key).expect("subject"));
+    let subject = PublicKey::from_string(&identity_of(subject_key).await).expect("subject key");
     let certifier_wallet =
         ProtoWallet::new(PrivateKey::from_hex(certifier_key).expect("certifier"));
-    let mut certificate = Certificate {
-        cert_type: CertificateType([7; 32]),
-        serial_number: SerialNumber([9; 32]),
-        subject: PublicKey::from_string(subject).expect("subject key"),
-        certifier: PublicKey::from_string(&identity_of(certifier_key).await)
-            .expect("certifier key"),
-        revocation_outpoint: Some("00".repeat(32)),
-        fields: None,
-        signature: None,
-    };
-    AuthCertificate::sign(&mut certificate, &certifier_wallet)
+    let fields = [("membership".to_string(), "active".to_string())]
+        .into_iter()
+        .collect();
+    let master = MasterCertificate::issue_certificate_for_subject(
+        &CertificateType([7; 32]),
+        &subject,
+        fields,
+        &certifier_wallet,
+        default_get_revocation_outpoint,
+        Some(SerialNumber([9; 32])),
+    )
+    .await
+    .expect("issue membership certificate");
+    let keyring = master
+        .create_keyring_for_verifier(
+            &PublicKey::from_string(verifier).expect("verifier key"),
+            &["membership".to_string()],
+            &master.certificate.certifier,
+            &subject_wallet,
+        )
         .await
-        .expect("sign membership certificate");
-    certificate
+        .expect("create verifier keyring");
+    VerifiableCertificate::new(master.certificate, keyring)
 }
 
 /// Deterministic stand-in for the consumer's network-backed revocation query.
@@ -321,10 +335,12 @@ async fn legacy_server_missing_authentication_success_fails_within_five_seconds(
 }
 
 #[tokio::test]
-async fn exported_server_certificate_response_reaches_client_verified_channel() {
+async fn exported_server_certificate_response_reaches_awaited_client_listener() {
     let server_identity = identity_of(SERVER_KEY).await;
+    let client_identity = identity_of(CLIENT_KEY).await;
     let certifier_identity = identity_of(CERTIFIER_KEY).await;
-    let server_certificate = membership_certificate(&server_identity, CERTIFIER_KEY).await;
+    let server_certificate =
+        membership_certificate(SERVER_KEY, CERTIFIER_KEY, &client_identity).await;
     let core: SharedAuthSocketServer<ProtoWallet> = Arc::new(AuthSocketServer::new());
     let (layer, io) = SocketIo::new_layer();
     let (sent_tx, mut sent_rx) = mpsc::unbounded_channel();
@@ -394,7 +410,14 @@ async fn exported_server_certificate_response_reaches_client_verified_channel() 
         Arc::new(SocketIOTransport::new(socket.clone(), auth_rx)),
     );
     peer.set_certificates_to_request(membership_request(certifier_identity));
-    let mut certificates = peer.on_certificates().expect("fresh certificate receiver");
+    let (certificate_tx, mut certificates) = mpsc::unbounded_channel();
+    peer.listen_for_certificates_received(Arc::new(move |signer, batch| {
+        let certificate_tx = certificate_tx.clone();
+        Box::pin(async move {
+            let _ = certificate_tx.send((signer, batch));
+            Ok(())
+        })
+    }));
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
         peer.get_authenticated_session(""),
@@ -410,10 +433,6 @@ async fn exported_server_certificate_response_reaches_client_verified_channel() 
             .expect("response result channel"),
         "exported helper must emit the SDK-signed server response"
     );
-    tokio::time::timeout(std::time::Duration::from_secs(5), peer.process_pending())
-        .await
-        .expect("client certificate-response processing timeout")
-        .expect("client must verify the server certificate response");
     let (signer, batch) =
         tokio::time::timeout(std::time::Duration::from_secs(5), certificates.recv())
             .await
@@ -421,6 +440,16 @@ async fn exported_server_certificate_response_reaches_client_verified_channel() 
             .expect("certificate channel");
     assert_eq!(signer, server_identity);
     assert_eq!(batch.len(), 1);
+    assert!(
+        !batch[0].keyring.is_empty(),
+        "wire keyring must be retained"
+    );
+    let verifier_wallet = ProtoWallet::new(PrivateKey::from_hex(CLIENT_KEY).expect("client key"));
+    let fields = batch[0]
+        .decrypt_fields(&verifier_wallet)
+        .await
+        .expect("client decrypts selectively disclosed membership field");
+    assert_eq!(fields.get("membership").map(String::as_str), Some("active"));
     socket.disconnect().await.expect("disconnect");
 }
 
@@ -524,7 +553,7 @@ async fn rejected_certificate_closes_socket_before_authentication_success() {
     .expect("send app event while pending");
     peer.send_certificate_response(
         &verifier,
-        vec![membership_certificate(&client_identity, SERVER_KEY).await],
+        vec![membership_certificate(CLIENT_KEY, SERVER_KEY, &verifier).await],
     )
     .await
     .expect("send rejecting certificate response");
@@ -584,10 +613,9 @@ async fn authsocket_client_completes_with_slow_accepting_certificate_authorizer(
             // event may arrive while this decision is still pending.
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             // bsv-sdk has already authenticated `identity`, the response
-            // signature/replay nonce, and each certificate's subject,
-            // and signature. bsv-sdk 0.7.1 does not constrain certificate type
-            // on this response path, so application policy checks the requested
-            // type, certifier trust, and live revocation status here.
+            // signature/replay nonce, each certificate's subject/signature,
+            // requested type, and selectively disclosed fields. Application
+            // policy still checks certifier trust and live revocation status.
             let certificate = certificates.first();
             let trusted_metadata = certificates.len() == 1
                 && identity == expected_client
@@ -617,7 +645,7 @@ async fn authsocket_client_completes_with_slow_accepting_certificate_authorizer(
         &url,
         &client_identity,
         wallet,
-        vec![membership_certificate(&client_identity, SERVER_KEY).await],
+        vec![membership_certificate(CLIENT_KEY, SERVER_KEY, &server_identity).await],
     )
     .await
     .expect("crate client must complete certificate-gated authentication");

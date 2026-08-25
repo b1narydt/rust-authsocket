@@ -21,8 +21,9 @@
 
 use std::sync::Arc;
 
+use bsv::auth::certificates::VerifiableCertificate;
 use bsv::auth::types::AuthMessage;
-use bsv::wallet::interfaces::{Certificate, WalletInterface};
+use bsv::wallet::interfaces::WalletInterface;
 use serde_json::Value;
 use socketioxide::extract::{Data, SocketRef};
 use socketioxide::SocketIo;
@@ -359,7 +360,7 @@ pub async fn send_certificate_response<W>(
     server: &AuthSocketServer<W>,
     socket_id: &str,
     identity_key: &str,
-    certificates: Vec<Certificate>,
+    certificates: Vec<VerifiableCertificate>,
 ) -> bool
 where
     W: WalletInterface + Send + Sync + 'static,

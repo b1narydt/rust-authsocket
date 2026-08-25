@@ -19,14 +19,9 @@ client = ["dep:rust_socketio"]
 
 [dependencies]
 # BRC-103 auth engine (Peer, Transport, AuthMessage) — we wrap, never reimplement.
-# Plain crates.io dependency: the whole consumer graph (rust-mpc,
-# rust-messagebox-client) moved off git pins onto the published bsv-sdk, and a
-# git-pinned copy here would split the graph into two bsv-sdk packages whose
-# WalletInterface/Peer types don't unify. Version 0.7.1 is the minimum because
-# it is the first release whose certificateResponse dispatch performs nonce,
-# session, signature, replay, and certificate validation before delivery on
-# Peer::on_certificates. Cargo.lock retains the exact resolved version.
-bsv-sdk = { version = "0.7.1", features = ["network"] }
+# Local 0.8 validation source. Keep this path until the release is published;
+# using a second SDK source would split WalletInterface/Peer types in consumers.
+bsv-sdk = { path = "/Users/donot/PARAGON/PARAGON-code/bsv-sdk-recv", features = ["network"] }
 
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 async-trait = "0.1"

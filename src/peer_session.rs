@@ -2,8 +2,9 @@
 //!
 //! [`PeerHandle`] owns one bsv-sdk [`Peer`] plus the channel ends of its
 //! [`ChannelTransport`], and exposes the operations both Socket.IO sides need:
-//!  - [`PeerHandle::drive`] — feed one inbound `AuthMessage`, advance the Peer,
-//!    and return (a) outbound `AuthMessage`s to `emit` over the socket and
+//!  - [`PeerHandle::drive`] — feed one inbound `AuthMessage` to the Peer's
+//!    background receiver, await its dispatch result, and return (a) outbound
+//!    `AuthMessage`s to `emit` over the socket and
 //!    (b) decoded, *verified* application events, each tagged with the
 //!    cryptographically verified sender key.
 //!  - [`PeerHandle::emit_existing`] — sign an application event for an
@@ -16,14 +17,17 @@
 //!    initial `authenticated` emit is what starts the handshake); a server
 //!    must never call this on a broadcast path.
 //!
-//! The bsv-sdk `Peer` is not self-driving (no internal read loop), so the caller
-//! must `drive` it whenever an inbound frame arrives.
+//! The bsv-sdk `Peer` owns its receive task. `PeerHandle::drive` only bridges a
+//! socket callback to that task and correlates the resulting observer event.
 //!
 //! [`Peer`]: bsv::auth::peer::Peer
 //! [`ChannelTransport`]: crate::transport::ChannelTransport
 
+#[cfg(feature = "server")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use bsv::auth::certificates::VerifiableCertificate;
 use bsv::auth::error::AuthError;
 #[cfg(feature = "server")]
 use bsv::auth::peer::OnCertificateRequestReceived;
@@ -31,8 +35,6 @@ use bsv::auth::peer::Peer;
 use bsv::auth::types::AuthMessage;
 #[cfg(feature = "server")]
 use bsv::auth::types::RequestedCertificateSet;
-#[cfg(feature = "server")]
-use bsv::wallet::interfaces::Certificate;
 use bsv::wallet::interfaces::WalletInterface;
 use serde_json::Value;
 use tokio::sync::{mpsc, Mutex};
@@ -61,8 +63,7 @@ pub struct VerifiedEvent {
     pub data: Value,
 }
 
-#[cfg(feature = "server")]
-type VerifiedCertificateBatch = (String, Vec<Certificate>);
+type VerifiedCertificateBatch = (String, Vec<VerifiableCertificate>);
 
 #[cfg(feature = "server")]
 pub(crate) struct CertificateDrive {
@@ -72,10 +73,28 @@ pub(crate) struct CertificateDrive {
     pub error: Option<AuthError>,
 }
 
+#[derive(Default)]
+struct InboundCompletion {
+    outbound: Vec<AuthMessage>,
+    events: Vec<VerifiedEvent>,
+    #[cfg(feature = "server")]
+    certificates: Vec<VerifiedCertificateBatch>,
+    error: Option<AuthError>,
+}
+
+impl InboundCompletion {
+    fn error(error: AuthError) -> Self {
+        tracing::warn!(error = %error, "authsocket: background frame dispatch failed");
+        Self {
+            error: Some(error),
+            ..Self::default()
+        }
+    }
+}
+
 /// Owns a `Peer` and the channels bridging it to a Socket.IO connection.
 pub struct PeerHandle<W: WalletInterface + 'static> {
-    /// The 0.3 `Peer` is fully `&self` (interior mutability), so no outer lock
-    /// is needed — per-socket operations never serialize on this handle.
+    /// The SDK Peer is cloneable and internally synchronized.
     peer: Peer<W>,
     /// Push inbound `"authMessage"` frames here (Socket.IO → Peer).
     incoming_tx: mpsc::Sender<AuthMessage>,
@@ -84,20 +103,38 @@ pub struct PeerHandle<W: WalletInterface + 'static> {
     /// Decoded, verified BRC-103 general-message payloads with their verified
     /// sender key (app events).
     general_rx: Mutex<mpsc::Receiver<(String, Vec<u8>)>>,
+    /// Pure observer used to correlate certificate-request dispatch.
+    certificate_request_rx:
+        Mutex<mpsc::Receiver<(String, bsv::auth::types::RequestedCertificateSet)>>,
+    /// Background dispatch failures surfaced by the SDK error observer.
+    error_rx: Mutex<mpsc::Receiver<bsv::auth::peer::BackgroundError>>,
+    /// Serializes inbound handoff so observer results stay associated with the
+    /// `on_auth_message` call whose public API returns them.
+    drive_io: Mutex<()>,
     /// Serializes certificate-aware driving with server-side certificate
     /// responses so neither operation can drain the other's outbound frames.
     #[cfg(feature = "server")]
     certificate_io: Mutex<()>,
-    /// SDK-verified certificate batches. Present only for certificate-gated
-    /// server peers. Every build takes the SDK's bounded receiver; builds that
-    /// do not consume certificates drop it immediately so SDK sends can never
-    /// block on an unobserved full channel.
+    /// SDK-verified certificate batches delivered by the awaited 0.8 listener.
+    certificate_rx: Mutex<mpsc::UnboundedReceiver<VerifiedCertificateBatch>>,
     #[cfg(feature = "server")]
-    certificate_rx: Option<Mutex<mpsc::Receiver<VerifiedCertificateBatch>>>,
+    receive_certificates: bool,
+    #[cfg(feature = "server")]
+    certificate_request_listener_count: AtomicUsize,
+    #[cfg(feature = "server")]
+    certificate_request_handled_rx: Mutex<mpsc::UnboundedReceiver<()>>,
+    #[cfg(feature = "server")]
+    certificate_request_handled_tx: mpsc::UnboundedSender<()>,
+    /// General frames held by the SDK until certificate validation succeeds.
+    #[cfg(feature = "server")]
+    deferred_general_count: AtomicUsize,
 }
 
 impl<W: WalletInterface + 'static> PeerHandle<W> {
     /// Build a fresh session for one connection.
+    ///
+    /// Must be called from inside a Tokio runtime because bsv-sdk starts the
+    /// Peer's background receive task during construction.
     pub fn new(wallet: W) -> Self {
         #[cfg(feature = "server")]
         {
@@ -109,9 +146,8 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
         }
     }
 
-    /// Internal server construction path. `receive_certificates` retains the
-    /// SDK certificate receiver for certificate-aware drives; otherwise the
-    /// receiver is taken and dropped during construction.
+    /// Internal server construction path. `receive_certificates` controls
+    /// whether verified batches are returned to the server authorizer.
     #[cfg(feature = "server")]
     pub(crate) fn new_for_server(
         wallet: W,
@@ -137,22 +173,49 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
         let general_rx = peer
             .on_general_message()
             .expect("on_general_message must succeed on a fresh Peer");
-        let certificate_rx = peer
-            .on_certificates()
-            .expect("on_certificates must succeed on a fresh Peer");
+        let (certificate_tx, certificate_rx) = mpsc::unbounded_channel();
+        peer.listen_for_certificates_received(Arc::new(move |identity_key, certificates| {
+            let certificate_tx = certificate_tx.clone();
+            Box::pin(async move {
+                certificate_tx
+                    .send((identity_key, certificates))
+                    .map_err(|_| {
+                        AuthError::TransportError(
+                            "authsocket certificate listener closed during dispatch".into(),
+                        )
+                    })
+            })
+        }));
+        let certificate_request_rx = peer
+            .on_certificate_request()
+            .expect("on_certificate_request must succeed on a fresh Peer");
+        let error_rx = peer
+            .on_error()
+            .expect("on_error must succeed on a fresh Peer");
         #[cfg(feature = "server")]
-        let certificate_rx = receive_certificates.then(|| Mutex::new(certificate_rx));
-        #[cfg(not(feature = "server"))]
-        drop(certificate_rx);
+        let (certificate_request_handled_tx, certificate_request_handled_rx) =
+            mpsc::unbounded_channel();
         Self {
             peer,
             incoming_tx,
             outgoing_rx: Mutex::new(outgoing_rx),
             general_rx: Mutex::new(general_rx),
+            certificate_request_rx: Mutex::new(certificate_request_rx),
+            error_rx: Mutex::new(error_rx),
+            drive_io: Mutex::new(()),
             #[cfg(feature = "server")]
             certificate_io: Mutex::new(()),
+            certificate_rx: Mutex::new(certificate_rx),
             #[cfg(feature = "server")]
-            certificate_rx,
+            receive_certificates,
+            #[cfg(feature = "server")]
+            certificate_request_listener_count: AtomicUsize::new(0),
+            #[cfg(feature = "server")]
+            certificate_request_handled_rx: Mutex::new(certificate_request_handled_rx),
+            #[cfg(feature = "server")]
+            certificate_request_handled_tx,
+            #[cfg(feature = "server")]
+            deferred_general_count: AtomicUsize::new(0),
         }
     }
 
@@ -165,8 +228,11 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
     ///    messages. Each carries the **verified** sender key (see
     ///    [`VerifiedEvent`]); a frame that fails verification produces no event.
     pub async fn drive(&self, inbound: AuthMessage) -> (Vec<AuthMessage>, Vec<VerifiedEvent>) {
-        let _ = self.process_inbound(inbound).await;
-        (self.drain_outbound().await, self.drain_events().await)
+        let _guard = self.drive_io.lock().await;
+        let mut completion = self.process_inbound(inbound).await;
+        completion.outbound.extend(self.drain_outbound().await);
+        completion.events.extend(self.drain_events().await);
+        (completion.outbound, completion.events)
     }
 
     /// Certificate-aware variant of [`PeerHandle::drive`]. It has identical
@@ -176,28 +242,78 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
     #[cfg(feature = "server")]
     pub(crate) async fn drive_certificate_aware(&self, inbound: AuthMessage) -> CertificateDrive {
         let _guard = self.certificate_io.lock().await;
-        let error = self.process_inbound(inbound).await.err();
+        let _drive_guard = self.drive_io.lock().await;
+        let mut completion = self.process_inbound(inbound).await;
+        completion.outbound.extend(self.drain_outbound().await);
+        completion.events.extend(self.drain_events().await);
+        completion
+            .certificates
+            .extend(self.drain_certificates().await);
         CertificateDrive {
-            outbound: self.drain_outbound().await,
-            events: self.drain_events().await,
-            certificates: self.drain_certificates().await,
-            error,
+            outbound: completion.outbound,
+            events: completion.events,
+            certificates: completion.certificates,
+            error: completion.error,
         }
     }
 
-    async fn process_inbound(&self, inbound: AuthMessage) -> Result<(), AuthError> {
-        // Hand the frame to the Peer's transport input.
-        let _ = self.incoming_tx.send(inbound).await;
-
-        // Advance the protocol (verifies signatures, runs handshake steps, emits
-        // general messages onto general_rx and outbound frames onto outgoing_rx).
-        // A failure means verification did not complete for some frame — the
-        // Peer never pushes an unverified event, so we just log and drain.
-        let result = self.peer.process_pending().await;
-        if let Err(e) = &result {
-            tracing::warn!(error = %e, "authsocket: process_pending (frame not verified)");
+    async fn process_inbound(&self, inbound: AuthMessage) -> InboundCompletion {
+        let message_type = inbound.message_type.clone();
+        let requested = inbound.requested_certificates.clone();
+        if self.incoming_tx.send(inbound).await.is_err() {
+            return InboundCompletion::error(AuthError::TransportError(
+                "authsocket transport input closed".into(),
+            ));
         }
-        result.map(|_| ())
+
+        match message_type {
+            bsv::auth::types::MessageType::InitialRequest => self.await_outbound().await,
+            bsv::auth::types::MessageType::General => self.await_general().await,
+            bsv::auth::types::MessageType::CertificateResponse => {
+                let completion = self.await_certificates().await;
+                #[cfg(feature = "server")]
+                let mut completion = completion;
+                #[cfg(feature = "server")]
+                if completion.error.is_none() {
+                    let deferred = self.deferred_general_count.swap(0, Ordering::SeqCst);
+                    for _ in 0..deferred {
+                        let released = self.await_general().await;
+                        if let Some(error) = released.error {
+                            tracing::warn!(error = %error,
+                                "authsocket: certificate-gated general frame was rejected");
+                        }
+                        completion.events.extend(released.events);
+                    }
+                }
+                completion
+            }
+            bsv::auth::types::MessageType::CertificateRequest => {
+                let has_requested_certifiers = requested
+                    .as_ref()
+                    .is_some_and(|requested| !requested.certifiers.is_empty());
+                #[cfg(feature = "server")]
+                if has_requested_certifiers
+                    && self
+                        .certificate_request_listener_count
+                        .load(Ordering::SeqCst)
+                        > 0
+                {
+                    return self.await_certificate_request_handler().await;
+                }
+                let completion = self.await_certificate_request().await;
+                if completion.error.is_some() || !has_requested_certifiers {
+                    completion
+                } else {
+                    self.await_outbound().await
+                }
+            }
+            // Initial responses are routed directly to an SDK handshake waiter;
+            // a server PeerHandle never initiates that handshake direction.
+            bsv::auth::types::MessageType::InitialResponse => {
+                tokio::task::yield_now().await;
+                InboundCompletion::default()
+            }
+        }
     }
 
     /// Sign an application event for an **already-authenticated** session and
@@ -237,8 +353,7 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
         Ok(self.drain_outbound().await)
     }
 
-    /// Direct access to the owned `Peer` (client backend needs `send_message`
-    /// concurrently with the receive loop).
+    /// Direct access to the owned, internally synchronized `Peer`.
     pub fn peer(&self) -> &Peer<W> {
         &self.peer
     }
@@ -249,7 +364,15 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
         &self,
         callback: Arc<OnCertificateRequestReceived>,
     ) -> u64 {
-        self.peer.listen_for_certificates_requested(callback)
+        let handled = self.certificate_request_handled_tx.clone();
+        let callback = Arc::new(move |identity_key, requested| {
+            callback(identity_key, requested);
+            let _ = handled.send(());
+        });
+        let id = self.peer.listen_for_certificates_requested(callback);
+        self.certificate_request_listener_count
+            .fetch_add(1, Ordering::SeqCst);
+        id
     }
 
     /// Stop a certificate-request handler registered on this peer.
@@ -257,6 +380,8 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
     pub(crate) fn stop_listening_for_certificates_requested(&self, callback_id: u64) {
         self.peer
             .stop_listening_for_certificates_requested(callback_id);
+        self.certificate_request_listener_count
+            .fetch_sub(1, Ordering::SeqCst);
     }
 
     /// Send certificates only when `identity_key` already resolves an
@@ -268,7 +393,7 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
     pub(crate) async fn send_certificate_response_existing(
         &self,
         identity_key: &str,
-        certificates: Vec<Certificate>,
+        certificates: Vec<VerifiableCertificate>,
     ) -> Result<Vec<AuthMessage>, AuthError> {
         let _guard = self.certificate_io.lock().await;
         // Use the same active-session lookup as SDK verification/signing paths.
@@ -283,10 +408,19 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
         Ok(self.drain_outbound().await)
     }
 
-    /// Push one inbound frame without driving (client receive loop feeds the
-    /// transport from its socket callback, then drives from its own task).
+    /// Push one inbound frame to the SDK-owned background receive task.
     pub async fn feed(&self, inbound: AuthMessage) {
         let _ = self.incoming_tx.send(inbound).await;
+    }
+
+    /// Enqueue a general frame whose sequential SDK worker is waiting for
+    /// certificate validation. The releasing certificate response collects it.
+    #[cfg(feature = "server")]
+    pub(crate) async fn feed_certificate_gated_general(&self, inbound: AuthMessage) {
+        self.deferred_general_count.fetch_add(1, Ordering::SeqCst);
+        if self.incoming_tx.send(inbound).await.is_err() {
+            self.deferred_general_count.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     /// Drain any outbound frames produced by the Peer.
@@ -294,7 +428,7 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
         let mut out = Vec::new();
         let mut rx = self.outgoing_rx.lock().await;
         while let Ok(m) = rx.try_recv() {
-            out.push(m);
+            out.push(Self::normalize_outbound(m));
         }
         out
     }
@@ -314,13 +448,160 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
         events
     }
 
+    async fn await_outbound(&self) -> InboundCompletion {
+        let mut outgoing = self.outgoing_rx.lock().await;
+        let mut errors = self.error_rx.lock().await;
+        tokio::select! {
+            message = outgoing.recv() => match message {
+                Some(message) => InboundCompletion {
+                    outbound: vec![Self::normalize_outbound(message)],
+                    ..InboundCompletion::default()
+                },
+                None => InboundCompletion::error(AuthError::TransportError(
+                    "authsocket transport output closed".into(),
+                )),
+            },
+            error = errors.recv() => Self::background_error_completion(error),
+        }
+    }
+
+    async fn await_general(&self) -> InboundCompletion {
+        let mut general = self.general_rx.lock().await;
+        let mut errors = self.error_rx.lock().await;
+        tokio::select! {
+            message = general.recv() => match message {
+                Some((sender, payload)) => InboundCompletion {
+                    events: decode_event(&payload)
+                        .map(|(event_name, data)| vec![VerifiedEvent {
+                            sender,
+                            event_name,
+                            data,
+                        }])
+                        .unwrap_or_default(),
+                    ..InboundCompletion::default()
+                },
+                None => InboundCompletion::error(AuthError::TransportError(
+                    "authsocket general-message observer closed".into(),
+                )),
+            },
+            error = errors.recv() => Self::background_error_completion(error),
+        }
+    }
+
+    async fn await_certificate_request(&self) -> InboundCompletion {
+        let mut requests = self.certificate_request_rx.lock().await;
+        let mut errors = self.error_rx.lock().await;
+        tokio::select! {
+            request = requests.recv() => match request {
+                Some(_) => InboundCompletion::default(),
+                None => InboundCompletion::error(AuthError::TransportError(
+                    "authsocket certificate-request observer closed".into(),
+                )),
+            },
+            error = errors.recv() => Self::background_error_completion(error),
+        }
+    }
+
+    #[cfg(feature = "server")]
+    async fn await_certificate_request_handler(&self) -> InboundCompletion {
+        let mut handled = self.certificate_request_handled_rx.lock().await;
+        let mut errors = self.error_rx.lock().await;
+        tokio::select! {
+            result = handled.recv() => match result {
+                Some(()) => InboundCompletion::default(),
+                None => InboundCompletion::error(AuthError::TransportError(
+                    "authsocket certificate-request listener bridge closed".into(),
+                )),
+            },
+            error = errors.recv() => Self::background_error_completion(error),
+        }
+    }
+
+    async fn await_certificates(&self) -> InboundCompletion {
+        let mut certificates = self.certificate_rx.lock().await;
+        let mut errors = self.error_rx.lock().await;
+        loop {
+            tokio::select! {
+                batch = certificates.recv() => return match batch {
+                    Some(batch) => {
+                        #[cfg(feature = "server")]
+                        {
+                            InboundCompletion {
+                                certificates: self.receive_certificates.then_some(batch).into_iter().collect(),
+                                ..InboundCompletion::default()
+                            }
+                        }
+                        #[cfg(not(feature = "server"))]
+                        {
+                            let _ = batch;
+                            InboundCompletion::default()
+                        }
+                    },
+                    None => InboundCompletion::error(AuthError::TransportError(
+                        "authsocket certificate listener closed".into(),
+                    )),
+                },
+                error = errors.recv() => match error {
+                    Some(background)
+                        if background.message_type
+                            == Some(bsv::auth::types::MessageType::CertificateResponse) =>
+                    {
+                        return InboundCompletion::error(background.error);
+                    }
+                    Some(background) => {
+                        #[cfg(feature = "server")]
+                        if background.message_type
+                            == Some(bsv::auth::types::MessageType::General)
+                        {
+                            let _ = self.deferred_general_count.fetch_update(
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                                |count| count.checked_sub(1),
+                            );
+                        }
+                        tracing::warn!(
+                            message_type = ?background.message_type,
+                            error = %background.error,
+                            "authsocket: unrelated background dispatch failed during certificate processing"
+                        );
+                    }
+                    None => return InboundCompletion::error(AuthError::TransportError(
+                        "authsocket background-error observer closed".into(),
+                    )),
+                },
+            }
+        }
+    }
+
+    fn background_error_completion(
+        error: Option<bsv::auth::peer::BackgroundError>,
+    ) -> InboundCompletion {
+        match error {
+            Some(error) => InboundCompletion::error(error.error),
+            None => InboundCompletion::error(AuthError::TransportError(
+                "authsocket background-error observer closed".into(),
+            )),
+        }
+    }
+
+    fn normalize_outbound(mut message: AuthMessage) -> AuthMessage {
+        if message
+            .requested_certificates
+            .as_ref()
+            .is_some_and(bsv::auth::types::RequestedCertificateSet::is_empty)
+        {
+            message.requested_certificates = None;
+        }
+        message
+    }
+
     #[cfg(feature = "server")]
     async fn drain_certificates(&self) -> Vec<VerifiedCertificateBatch> {
-        let Some(rx) = &self.certificate_rx else {
+        if !self.receive_certificates {
             return Vec::new();
-        };
+        }
         let mut certificates = Vec::new();
-        let mut rx = rx.lock().await;
+        let mut rx = self.certificate_rx.lock().await;
         while let Ok(batch) = rx.try_recv() {
             certificates.push(batch);
         }

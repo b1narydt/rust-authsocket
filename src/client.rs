@@ -10,9 +10,9 @@
 //!   connect-ack gate, client-initiated BRC-103 handshake
 //!   (`peer.send_message("", authenticated-payload)`), `authenticationSuccess`
 //!   oneshot.
-//! - the background receive loop (drives `Peer::process_next`), the
-//!   general-message dispatcher (verified events → `on(event)` handlers or the
-//!   fallback), the keepalive probe and the read-deadline watchdog.
+//! - the SDK-owned background receiver, the general-message dispatcher
+//!   (verified events → `on(event)` handlers or the fallback), the keepalive
+//!   probe and the read-deadline watchdog.
 //! - PROMPT DEATH DETECTION: the Socket.IO `error` callback wakes the keepalive
 //!   for an immediate probe emit, so `is_connected()` tells the truth within
 //!   milliseconds of a peer that vanished without a protocol goodbye (SIGKILL,
@@ -39,11 +39,12 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 
 use async_trait::async_trait;
+use bsv::auth::certificates::VerifiableCertificate;
 use bsv::auth::error::AuthError;
 use bsv::auth::peer::Peer;
 use bsv::auth::transports::Transport;
 use bsv::auth::types::{AuthMessage, MessageType, RequestedCertificateSet};
-use bsv::wallet::interfaces::{Certificate, WalletInterface};
+use bsv::wallet::interfaces::WalletInterface;
 
 use crate::wire::{decode_event, encode_event, AUTH_MESSAGE_EVENT};
 
@@ -184,7 +185,8 @@ pub type CertificateProvider = Arc<
     dyn Fn(
             String,
             RequestedCertificateSet,
-        ) -> Pin<Box<dyn Future<Output = Result<Vec<Certificate>, String>> + Send>>
+        )
+            -> Pin<Box<dyn Future<Output = Result<Vec<VerifiableCertificate>, String>> + Send>>
         + Send
         + Sync,
 >;
@@ -286,7 +288,7 @@ fn now_ms() -> u64 {
 /// Serialize a signed `AuthMessage` and emit it as `authMessage` — the same
 /// wire framing `SocketIOTransport::send` uses. Emitting directly (rather than
 /// through the Peer's transport) lets the send path run concurrently with the
-/// receive task's `process_next`.
+/// SDK-owned background receiver.
 async fn emit_auth_message(client: &SocketClient, message: &AuthMessage) -> Result<(), String> {
     let json = serde_json::to_value(message).map_err(|e| e.to_string())?;
     client
@@ -307,14 +309,14 @@ async fn emit_auth_message(client: &SocketClient, message: &AuthMessage) -> Resu
 /// event-name match) or the [`AuthSocketClient::set_fallback`] handler.
 ///
 /// This high-level client has no API for observing certificates sent by the
-/// server. The SDK can verify an inbound `certificateResponse` while advancing
-/// the protocol, but `AuthSocketClient` drops the certificate receiver and the
-/// delivered batch is discarded. The `connect_with_certificates` and
+/// server. The SDK verifies inbound `certificateResponse` messages, and with no
+/// registered listener their delivered batches require no application-side
+/// draining. The `connect_with_certificates` and
 /// `connect_with_certificate_provider` families supply this client's
 /// certificates to a requesting server; they do not expose server
 /// certificates. Consumers that need the latter must drive a
-/// [`Peer`](bsv::auth::peer::Peer) with [`SocketIOTransport`] directly and keep
-/// its `on_certificates` receiver.
+/// [`Peer`](bsv::auth::peer::Peer) with [`SocketIOTransport`] directly and
+/// register `listen_for_certificates_received`.
 pub struct AuthSocketClient {
     /// Socket.IO client handle. `Client` is `Clone` (an `Arc` over the
     /// connection) and every emit takes `&self` — concurrent emits are safe.
@@ -393,7 +395,7 @@ impl AuthSocketClient {
         url: &str,
         identity_key: &str,
         wallet: W,
-        certificates: Vec<Certificate>,
+        certificates: Vec<VerifiableCertificate>,
     ) -> Result<Self, ClientError>
     where
         W: WalletInterface + Send + Sync + 'static,
@@ -414,7 +416,7 @@ impl AuthSocketClient {
         url: &str,
         identity_key: &str,
         wallet: W,
-        certificates: Vec<Certificate>,
+        certificates: Vec<VerifiableCertificate>,
         options: AuthSocketClientOptions,
     ) -> Result<Self, ClientError>
     where
@@ -616,19 +618,23 @@ impl AuthSocketClient {
             .await
             .map_err(|e| ClientError::WebSocket(e.to_string()))?;
 
-        // Peer over the connected socket. Does NOT self-drive; the receive
-        // task below drives process_next().
+        // Peer over the connected socket. Construction starts the SDK-owned
+        // background receive task.
         let transport = SocketIOTransport::new(client.clone(), auth_msg_rx);
         let peer = Arc::new(Peer::new(wallet, Arc::new(transport)));
 
-        // Take and drop the SDK's bounded verified-certificate receiver. This
-        // high-level client has no inbound-certificate observer, so verified
-        // server batches are deliberately discarded; leaving the receiver
-        // alive but unread would block process_next on response 33.
-        drop(
-            peer.on_certificates()
-                .expect("on_certificates take-once: fresh Peer"),
-        );
+        // Drain and log the 0.8 error observer so background verification
+        // failures stay visible without becoming socket-fatal.
+        let mut peer_errors = peer.on_error().expect("on_error take-once: fresh Peer");
+        tokio::spawn(async move {
+            while let Some(background) = peer_errors.recv().await {
+                tracing::warn!(
+                    message_type = ?background.message_type,
+                    error = %background.error,
+                    "authsocket: background peer dispatch failed"
+                );
+            }
+        });
 
         // Provider mode takes control of the SDK callback before the handshake.
         // The callback itself is synchronous, so async certificate retrieval and
@@ -771,46 +777,6 @@ impl AuthSocketClient {
                     as Pin<Box<dyn Future<Output = Result<AuthMessage, String>> + Send>>
             })
         };
-
-        // Receive task: drives process_next() until tear-down. `process_next`
-        // returns Ok(false) both for "no message yet" AND a disconnected
-        // transport, so it exits on the death latch (or on `connected`
-        // flipping false — latched on the first observed true so it survives
-        // the pre-auth window).
-        {
-            let peer_for_recv = peer.clone();
-            let connected_for_recv = connected.clone();
-            let dead_for_recv = dead.clone();
-            tokio::spawn(async move {
-                let mut was_connected = false;
-                loop {
-                    if dead_for_recv.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    match peer_for_recv.process_next().await {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            let live = connected_for_recv.load(Ordering::SeqCst);
-                            was_connected |= live;
-                            if was_connected && !live {
-                                break;
-                            }
-                            tokio::time::sleep(Duration::from_millis(20)).await;
-                        }
-                        Err(_) => {
-                            // Verification errors (stale session, replayed
-                            // nonce) are non-fatal — the socket stays open.
-                            let live = connected_for_recv.load(Ordering::SeqCst);
-                            was_connected |= live;
-                            if was_connected && !live {
-                                break;
-                            }
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                        }
-                    }
-                }
-            });
-        }
 
         // Keepalive task: signed `authenticated` probe every KEEPALIVE_INTERVAL.
         // The server's signed authenticationSuccess reply refreshes the read
