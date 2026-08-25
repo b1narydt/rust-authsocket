@@ -69,6 +69,17 @@ pub type GeneralMessageReceiver = mpsc::Receiver<VerifiedGeneralMessage>;
 pub struct PeerPumpReceivers {
     pub outgoing: mpsc::Receiver<AuthMessage>,
     pub general: GeneralMessageReceiver,
+    pub(crate) connection_id: Option<crate::server::ConnectionId>,
+}
+
+#[cfg(feature = "server")]
+impl PeerPumpReceivers {
+    /// The exact connection registration these take-once receivers belong to.
+    pub fn connection_id(&self) -> &crate::server::ConnectionId {
+        self.connection_id
+            .as_ref()
+            .expect("server-owned pump receivers always carry a connection id")
+    }
 }
 
 /// Owns a `Peer` and the channels bridging it to a Socket.IO connection.
@@ -256,7 +267,11 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
     pub(crate) fn take_pump_receivers(&self) -> Option<PeerPumpReceivers> {
         let outgoing = self.outgoing_rx.lock().take()?;
         let general = self.general_rx.lock().take()?;
-        Some(PeerPumpReceivers { outgoing, general })
+        Some(PeerPumpReceivers {
+            outgoing,
+            general,
+            connection_id: None,
+        })
     }
 
     pub fn normalize_outbound(mut message: AuthMessage) -> AuthMessage {

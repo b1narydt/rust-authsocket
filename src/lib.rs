@@ -67,10 +67,10 @@ pub mod server;
 pub mod server_io;
 #[cfg(feature = "server")]
 pub use server::{
-    AuthSocketServer, CertificateAuthorization, CertificateAuthorizationDecision,
-    ConnectionPumpError, OnCertificatesRequested, SharedAuthSocketServer, VerifiedEventSink,
-    VerifiedEventSinkFuture, CERTIFICATE_AUTHORIZATION_TIMEOUT, MAX_DEFERRED_EVENTS,
-    MAX_DEFERRED_EVENT_BYTES,
+    AuthSocketServer, CertificateAuthorization, CertificateAuthorizationDecision, ConnectionId,
+    ConnectionPumpError, OnCertificatesRequested, SharedAuthSocketServer, VerifiedEventBatch,
+    VerifiedEventSink, VerifiedEventSinkFuture, CERTIFICATE_AUTHORIZATION_TIMEOUT,
+    MAX_DEFERRED_EVENTS, MAX_DEFERRED_EVENT_BYTES,
 };
 #[cfg(feature = "server")]
 pub use server_io::{

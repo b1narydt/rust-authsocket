@@ -6,11 +6,13 @@
 //! to send them over. The consumer (e.g. `rust-messagebox-server`, using
 //! `socketioxide`) wires the actual socket I/O to these calls:
 //!
-//! - on a new connection: [`AuthSocketServer::add_connection`].
-//! - on an inbound `"authMessage"` event: [`AuthSocketServer::on_auth_message`]
-//!   feeds the connection; the socket adapter's long-lived pump emits outbound
-//!   messages and dispatches verified events.
-//! - on disconnect: [`AuthSocketServer::remove_connection`].
+//! - on a new connection: [`AuthSocketServer::add_connection`], retaining its
+//!   returned [`ConnectionId`].
+//! - on an inbound `"authMessage"` event:
+//!   [`AuthSocketServer::on_auth_message_for`] feeds that exact connection; the
+//!   socket adapter's long-lived pump emits outbound messages and dispatches
+//!   verified events.
+//! - on disconnect: [`AuthSocketServer::remove_connection_if_current`].
 //! - to push a live message to a room: [`AuthSocketServer::emit_to_room`], then
 //!   `emit` each `(socket_id, AuthMessage)` over the matching socket.
 //!
@@ -45,6 +47,11 @@
 //!   parking them. That is not hypothetical — a rejection path once acquired
 //!   the deferral lock while holding the session-identity guard, inverting a
 //!   path that already held them the other way round.
+//! - **Server-map lock order is connections, then rooms.** Replacement and
+//!   compare-and-remove keep the connection-map write guard through room
+//!   cleanup, so a new registration cannot appear between the generation
+//!   comparison and removal of the old registration's SID memberships. No path
+//!   may hold a room guard while acquiring the connection map.
 //!
 //! **The fix this replaces:** the old server `broadcast_to_room` did a RAW,
 //! unsigned `io.to(room).emit(...)`, which only hit the client's fallback
@@ -68,7 +75,6 @@ use bsv::wallet::interfaces::WalletInterface;
 use futures_util::future::join_all;
 use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
-use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::peer_session::{PeerHandle, PeerPumpReceivers, VerifiedEvent};
@@ -136,6 +142,50 @@ type CertificateAuthorizerFuture =
     Pin<Box<dyn Future<Output = CertificateAuthorizationDecision> + Send + 'static>>;
 type CertificateAuthorizer =
     Arc<dyn Fn(String, Vec<VerifiableCertificate>) -> CertificateAuthorizerFuture + Send + Sync>;
+
+/// One admitted batch tied to the exact connection that produced it.
+#[derive(Debug)]
+pub struct VerifiedEventBatch {
+    connection_id: ConnectionId,
+    events: Vec<VerifiedEvent>,
+}
+
+impl VerifiedEventBatch {
+    fn new(connection_id: ConnectionId, events: Vec<VerifiedEvent>) -> Self {
+        Self {
+            connection_id,
+            events,
+        }
+    }
+
+    /// Exact connection registration that produced these events.
+    pub fn connection_id(&self) -> &ConnectionId {
+        &self.connection_id
+    }
+
+    /// Consume the batch and return its admitted events.
+    pub fn into_events(self) -> Vec<VerifiedEvent> {
+        self.events
+    }
+}
+
+impl std::ops::Deref for VerifiedEventBatch {
+    type Target = [VerifiedEvent];
+
+    fn deref(&self) -> &Self::Target {
+        &self.events
+    }
+}
+
+impl IntoIterator for VerifiedEventBatch {
+    type Item = VerifiedEvent;
+    type IntoIter = std::vec::IntoIter<VerifiedEvent>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.events.into_iter()
+    }
+}
+
 /// Future returned by a [`VerifiedEventSink`].
 pub type VerifiedEventSinkFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
@@ -145,13 +195,16 @@ pub type VerifiedEventSinkFuture = Pin<Box<dyn Future<Output = ()> + Send + 'sta
 /// starting [`AuthSocketServer::run_connection_pump`]. The connection keeps a
 /// strong clone of the sink until it is removed, so the caller may drop its
 /// own [`Arc`] without stopping delivery. Both events admitted immediately and
-/// events released after certificate authorization use this same sink. A
-/// terminal certificate transition may invoke the sink with an empty batch so
-/// an adapter can observe rejection and close its transport.
+/// events released after certificate authorization use this same sink.
+/// Authsocket drops a batch when its [`ConnectionId`] has already been
+/// superseded; the id remains in the public batch so consumers can also fence
+/// application work that spans an await. A terminal certificate transition may
+/// invoke the sink with an empty batch so an adapter can observe rejection and
+/// close its transport.
 pub type VerifiedEventSink =
-    Arc<dyn Fn(Vec<VerifiedEvent>) -> VerifiedEventSinkFuture + Send + Sync>;
+    Arc<dyn Fn(VerifiedEventBatch) -> VerifiedEventSinkFuture + Send + Sync>;
 type WeakVerifiedEventSink =
-    Weak<dyn Fn(Vec<VerifiedEvent>) -> VerifiedEventSinkFuture + Send + Sync>;
+    Weak<dyn Fn(VerifiedEventBatch) -> VerifiedEventSinkFuture + Send + Sync>;
 
 /// A transport-agnostic connection pump could not be started.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,6 +230,28 @@ impl std::fmt::Display for ConnectionPumpError {
 }
 
 impl std::error::Error for ConnectionPumpError {}
+
+/// Stable identity of one connection registration.
+///
+/// Socket ids may be reused. The generation distinguishes successive
+/// registrations that use the same transport-level id.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ConnectionId {
+    socket_id: String,
+    generation: u64,
+}
+
+impl ConnectionId {
+    /// Transport-level socket id shared by reconnects and replacements.
+    pub fn socket_id(&self) -> &str {
+        &self.socket_id
+    }
+
+    /// Server-wide monotonically increasing registration generation.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
 
 #[derive(Default)]
 struct DeferredEvents {
@@ -226,6 +301,9 @@ pub type OnCertificatesRequested =
     dyn Fn(String, String, RequestedCertificateSet) + Send + Sync + 'static;
 
 struct Connection<W: WalletInterface + 'static> {
+    id: ConnectionId,
+    active: AtomicBool,
+    lifecycle_changed: tokio::sync::Notify,
     handle: PeerHandle<W>,
     /// Set exclusively from a verified general-message sender — never from the
     /// unverified envelope claim.
@@ -245,17 +323,14 @@ struct Connection<W: WalletInterface + 'static> {
     ///
     /// Per-connection blocking locks follow one order: snapshot and release
     /// `session_peer_identity_key` first; then, when a transition needs more
-    /// than one lock, take `deferred_events`, `certificate_authorization`,
-    /// `identity_key`, and `certificate_deadline_task` in that order. Never
-    /// nest the session-identity lock with any of the transition locks.
+    /// than one lock, take `deferred_events`, `certificate_authorization`, and
+    /// `identity_key` in that order. Never nest the session-identity lock with
+    /// any of the transition locks.
     deferred_events: Mutex<DeferredEvents>,
     /// Claims the one consumer-authorizer future allowed for this Pending
     /// decision. The claim is acquired under `deferred_events` before awaiting
     /// and cleared by every terminal transition.
     certificate_authorizer_in_flight: AtomicBool,
-    /// Aborted when authorization resolves or the socket disconnects, so the
-    /// deadline task does not retain the socket/server until the full timeout.
-    certificate_deadline_task: RwLock<Option<JoinHandle<()>>>,
     /// SDK callback id for the bridge to the server-wide listener registry.
     certificate_request_bridge_id: RwLock<Option<u64>>,
     /// Installed by the socket adapter. The awaited SDK certificate listener
@@ -330,6 +405,7 @@ pub struct AuthSocketServer<W: WalletInterface + 'static> {
     certificate_authorization_deferral_limits: RwLock<(usize, usize)>,
     certificate_request_listeners: Arc<RwLock<HashMap<u64, Arc<OnCertificatesRequested>>>>,
     certificate_request_listener_id: AtomicU64,
+    connection_generation: AtomicU64,
 }
 
 impl<W: WalletInterface + 'static> Default for AuthSocketServer<W> {
@@ -352,6 +428,7 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
             )),
             certificate_request_listeners: Arc::new(RwLock::new(HashMap::new())),
             certificate_request_listener_id: AtomicU64::new(0),
+            connection_generation: AtomicU64::new(0),
         }
     }
 
@@ -454,8 +531,18 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
     ///
     /// Panics outside a Tokio runtime because bsv-sdk starts the per-connection
     /// Peer's background receive task during construction.
-    pub fn add_connection(&self, socket_id: impl Into<String>, wallet: W) {
+    pub fn add_connection(&self, socket_id: impl Into<String>, wallet: W) -> ConnectionId {
         let socket_id = socket_id.into();
+        let generation = self
+            .connection_generation
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("authsocket connection generation exhausted");
+        let id = ConnectionId {
+            socket_id: socket_id.clone(),
+            generation,
+        };
         let requested = self.certificates_to_request.read().clone();
         let sdk_certificate_gate = requested
             .as_ref()
@@ -486,6 +573,9 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
         };
         let listeners = self.certificate_request_listeners.read();
         let conn = Arc::new(Connection {
+            id: id.clone(),
+            active: AtomicBool::new(true),
+            lifecycle_changed: tokio::sync::Notify::new(),
             handle: PeerHandle::new_for_server(wallet, requested),
             identity_key: RwLock::new(None),
             session_peer_identity_key: RwLock::new(None),
@@ -496,7 +586,6 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
             max_deferred_event_bytes,
             deferred_events: Mutex::new(DeferredEvents::default()),
             certificate_authorizer_in_flight: AtomicBool::new(false),
-            certificate_deadline_task: RwLock::new(None),
             certificate_request_bridge_id: RwLock::new(None),
             verified_event_sink: RwLock::new(None),
             owned_verified_event_sink: RwLock::new(None),
@@ -524,13 +613,18 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
                         let Some(conn) = weak_conn.upgrade() else {
                             return;
                         };
+                        let count = events.len();
                         let sink = Self::registered_verified_event_sink(&conn);
+                        let batch = VerifiedEventBatch::new(conn.id.clone(), events);
+                        if !conn.active.load(Ordering::Acquire) {
+                            return;
+                        }
                         drop(conn);
                         if let Some(sink) = sink {
-                            sink(events).await;
+                            sink(batch).await;
                         } else {
                             tracing::error!(
-                                count = events.len(),
+                                count,
                                 "authsocket: admitted certificate-gated events have no registered sink"
                             );
                         }
@@ -545,14 +639,37 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
         if !listeners.is_empty() {
             self.install_certificate_request_bridge(&socket_id, &conn);
         }
-        conns.insert(socket_id, conn);
+        let replaced = conns.get(&socket_id).cloned();
+        if let Some(replaced) = &replaced {
+            Self::deactivate_connection(replaced);
+        }
+        conns.insert(socket_id.clone(), conn);
+        if replaced.is_some() {
+            self.remove_room_memberships(&socket_id);
+        }
+        id
     }
 
-    /// Drop a socket and its room memberships.
+    /// Drop whichever connection currently owns `socket_id` and its rooms.
+    ///
+    /// Transport callbacks tied to a particular physical connection should use
+    /// [`Self::remove_connection_if_current`] instead, because socket ids may be
+    /// reused before an old callback runs.
     pub fn remove_connection(&self, socket_id: &str) {
-        if let Some(conn) = self.conns.write().remove(socket_id) {
-            Self::abort_certificate_deadline_task(&conn);
+        let mut conns = self.conns.write();
+        if let Some(conn) = conns.get(socket_id) {
+            Self::deactivate_connection(conn);
         }
+        conns.remove(socket_id);
+        self.remove_room_memberships(socket_id);
+    }
+
+    fn deactivate_connection(conn: &Connection<W>) {
+        conn.active.store(false, Ordering::Release);
+        conn.lifecycle_changed.notify_one();
+    }
+
+    fn remove_room_memberships(&self, socket_id: &str) {
         let mut rooms = self.rooms.write();
         for members in rooms.values_mut() {
             members.remove(socket_id);
@@ -560,15 +677,71 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
         rooms.retain(|_, m| !m.is_empty());
     }
 
+    /// Remove a connection and its rooms only if this registration still owns
+    /// its socket id. Returns `false` for late teardown from a superseded
+    /// connection and leaves replacement state untouched.
+    pub fn remove_connection_if_current(&self, id: &ConnectionId) -> bool {
+        let mut conns = self.conns.write();
+        let removed = match conns.get(id.socket_id()) {
+            Some(conn) if conn.id == *id => {
+                Self::deactivate_connection(conn);
+                conns.remove(id.socket_id())
+            }
+            _ => None,
+        };
+        let Some(conn) = removed else {
+            return false;
+        };
+        drop(conn);
+        self.remove_room_memberships(id.socket_id());
+        true
+    }
+
+    /// Whether this registration still owns its socket id.
+    pub fn is_current_connection(&self, id: &ConnectionId) -> bool {
+        self.conns
+            .read()
+            .get(id.socket_id())
+            .is_some_and(|conn| conn.id == *id)
+    }
+
+    /// Whether `id` has been superseded by a newer registration of the same
+    /// socket id. An absent socket is not a replacement.
+    pub fn is_connection_superseded(&self, id: &ConnectionId) -> bool {
+        self.conns
+            .read()
+            .get(id.socket_id())
+            .is_some_and(|conn| conn.id != *id)
+    }
+
     /// Look up a connection handle (brief lock, `Arc` cloned out).
     fn conn(&self, socket_id: &str) -> Option<Arc<Connection<W>>> {
         self.conns.read().get(socket_id).cloned()
     }
 
+    fn conn_for_id(&self, id: &ConnectionId) -> Option<Arc<Connection<W>>> {
+        self.conns
+            .read()
+            .get(id.socket_id())
+            .filter(|conn| conn.id == *id)
+            .cloned()
+    }
+
     /// Current certificate authorization state for `socket_id`.
     pub fn certificate_authorization(&self, socket_id: &str) -> Option<CertificateAuthorization> {
         let conn = self.conn(socket_id)?;
-        Self::expire_connection(&conn, true);
+        Self::expire_connection(&conn);
+        let authorization = conn.certificate_authorization.read().clone();
+        Some(authorization)
+    }
+
+    /// Current authorization state only if this registration is still current.
+    pub fn certificate_authorization_for(
+        &self,
+        id: &ConnectionId,
+    ) -> Option<CertificateAuthorization> {
+        let conn = self.conn_for_id(id)?;
+        Self::expire_connection(&conn);
         let authorization = conn.certificate_authorization.read().clone();
         Some(authorization)
     }
@@ -579,22 +752,10 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
         let Some(conn) = self.conn(socket_id) else {
             return false;
         };
-        Self::expire_connection(&conn, true)
+        Self::expire_connection(&conn)
     }
 
-    pub(crate) fn expire_certificate_authorization_from_deadline(&self, socket_id: &str) -> bool {
-        let Some(conn) = self.conn(socket_id) else {
-            return false;
-        };
-        // Skip aborting here so the task can reach the adapter's cleanup. The
-        // subsequent remove_connection takes and aborts this task's own handle;
-        // that is safe because Tokio cancellation is cooperative and the
-        // adapter performs both removal and SocketRef::disconnect synchronously,
-        // with no await at which the self-abort could take effect.
-        Self::expire_connection(&conn, false)
-    }
-
-    fn expire_connection(conn: &Connection<W>, abort_deadline_task: bool) -> bool {
+    fn expire_connection(conn: &Connection<W>) -> bool {
         if !matches!(conn.certificate_deadline, Some(deadline) if Instant::now() >= deadline) {
             return false;
         }
@@ -615,48 +776,7 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
         deferred.clear();
         drop(authorization);
         drop(deferred);
-        if abort_deadline_task {
-            Self::abort_certificate_deadline_task(conn);
-        }
         true
-    }
-
-    fn abort_certificate_deadline_task(conn: &Connection<W>) {
-        if let Some(task) = conn.certificate_deadline_task.write().take() {
-            task.abort();
-        }
-    }
-
-    pub(crate) fn set_certificate_authorization_deadline_task(
-        &self,
-        socket_id: &str,
-        task: JoinHandle<()>,
-    ) {
-        let Some(conn) = self.conn(socket_id) else {
-            task.abort();
-            return;
-        };
-        if !matches!(
-            *conn.certificate_authorization.read(),
-            CertificateAuthorization::Pending
-        ) {
-            task.abort();
-            return;
-        }
-        *conn.certificate_deadline_task.write() = Some(task);
-        // Close the small race where authorization resolved after the first
-        // state check but before the handle was stored.
-        if !matches!(
-            *conn.certificate_authorization.read(),
-            CertificateAuthorization::Pending
-        ) {
-            Self::abort_certificate_deadline_task(&conn);
-        }
-    }
-
-    pub(crate) fn certificate_authorization_deadline(&self, socket_id: &str) -> Option<Instant> {
-        self.conn(socket_id)
-            .and_then(|conn| conn.certificate_deadline)
     }
 
     /// Register a server-wide certificate-request listener and install an SDK
@@ -733,7 +853,19 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
         let Some(conn) = self.conn(socket_id) else {
             return;
         };
-        Self::expire_connection(&conn, true);
+        self.feed_connection(&conn, msg).await;
+    }
+
+    /// Feed an inbound frame only if this exact registration is still current.
+    pub async fn on_auth_message_for(&self, id: &ConnectionId, msg: AuthMessage) {
+        let Some(conn) = self.conn_for_id(id) else {
+            return;
+        };
+        self.feed_connection(&conn, msg).await;
+    }
+
+    async fn feed_connection(&self, conn: &Connection<W>, msg: AuthMessage) {
+        Self::expire_connection(conn);
 
         if matches!(
             *conn.certificate_authorization.read(),
@@ -753,7 +885,20 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
     /// `general` directly exposes verified but not yet certificate-admitted
     /// payloads and therefore is not a substitute for the pump's event sink.
     pub fn take_pump_receivers(&self, socket_id: &str) -> Option<PeerPumpReceivers> {
-        self.conn(socket_id)?.handle.take_pump_receivers()
+        let conn = self.conn(socket_id)?;
+        Self::take_connection_pump_receivers(&conn)
+    }
+
+    /// Take pump receivers only for this exact connection registration.
+    pub fn take_pump_receivers_for(&self, id: &ConnectionId) -> Option<PeerPumpReceivers> {
+        let conn = self.conn_for_id(id)?;
+        Self::take_connection_pump_receivers(&conn)
+    }
+
+    fn take_connection_pump_receivers(conn: &Connection<W>) -> Option<PeerPumpReceivers> {
+        let mut receivers = conn.handle.take_pump_receivers()?;
+        receivers.connection_id = Some(conn.id.clone());
+        Some(receivers)
     }
 
     /// Register the admitted-event consumer for a connection.
@@ -766,12 +911,25 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
     /// sink.
     pub fn set_verified_event_sink(&self, socket_id: &str, sink: &VerifiedEventSink) {
         if let Some(conn) = self.conn(socket_id) {
-            *conn.verified_event_sink.write() = Some(Arc::downgrade(sink));
-            *conn.owned_verified_event_sink.write() = Some(sink.clone());
+            Self::register_verified_event_sink(&conn, sink);
         } else {
             tracing::error!(socket = %socket_id,
                 "authsocket: cannot register verified-event sink for missing connection");
         }
+    }
+
+    /// Register a sink only for this exact connection registration.
+    pub fn set_verified_event_sink_for(&self, id: &ConnectionId, sink: &VerifiedEventSink) -> bool {
+        let Some(conn) = self.conn_for_id(id) else {
+            return false;
+        };
+        Self::register_verified_event_sink(&conn, sink);
+        true
+    }
+
+    fn register_verified_event_sink(conn: &Connection<W>, sink: &VerifiedEventSink) {
+        *conn.verified_event_sink.write() = Some(Arc::downgrade(sink));
+        *conn.owned_verified_event_sink.write() = Some(sink.clone());
     }
 
     fn registered_verified_event_sink(conn: &Connection<W>) -> Option<VerifiedEventSink> {
@@ -796,6 +954,10 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
     /// The pump returns [`ConnectionPumpError::VerifiedEventSinkNotRegistered`]
     /// before draining either receiver when no sink is registered. Removing
     /// the connection closes the SDK senders and ends the pump successfully.
+    /// The take-once receivers bind the pump to their original [`ConnectionId`],
+    /// so a replacement registered before this future starts is never driven by
+    /// the old pump. The pump itself owns the certificate deadline and removes
+    /// an unanswered connection after sending the sink one terminal empty batch.
     pub async fn run_connection_pump<F, Fut>(
         &self,
         socket_id: &str,
@@ -807,45 +969,99 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
         F: Fn(AuthMessage) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let conn = self
-            .conn(socket_id)
-            .ok_or_else(|| ConnectionPumpError::ConnectionUnavailable(socket_id.to_string()))?;
-        let event_sink = Self::registered_verified_event_sink(&conn).ok_or_else(|| {
-            ConnectionPumpError::VerifiedEventSinkNotRegistered(socket_id.to_string())
-        })?;
-        drop(conn);
+        let connection_id = receivers.connection_id().clone();
+        if connection_id.socket_id() != socket_id {
+            return Err(ConnectionPumpError::ConnectionUnavailable(
+                socket_id.to_string(),
+            ));
+        }
+        let Some(conn) = self.conn_for_id(&connection_id) else {
+            return if self.conn(socket_id).is_some() {
+                Ok(())
+            } else {
+                Err(ConnectionPumpError::ConnectionUnavailable(
+                    socket_id.to_string(),
+                ))
+            };
+        };
+        let Some(event_sink) = Self::registered_verified_event_sink(&conn) else {
+            return Err(ConnectionPumpError::VerifiedEventSinkNotRegistered(
+                socket_id.to_string(),
+            ));
+        };
 
         let mut outgoing_open = true;
         let mut general_open = true;
         let mut emitting: Option<Pin<Box<Fut>>> = None;
         let mut dispatching: Option<VerifiedEventSinkFuture> = None;
+        let mut deadline = conn
+            .certificate_deadline
+            .map(tokio::time::sleep_until)
+            .map(Box::pin);
+        let mut deadline_expired = false;
         while outgoing_open || general_open || emitting.is_some() || dispatching.is_some() {
+            if !conn.active.load(Ordering::Acquire) {
+                break;
+            }
+            if deadline_expired && dispatching.is_none() {
+                self.remove_connection_if_current(&connection_id);
+                break;
+            }
             if receivers.outgoing.is_closed() && receivers.general.is_closed() {
                 break;
             }
             tokio::select! {
-                message = receivers.outgoing.recv(), if outgoing_open && emitting.is_none() => {
+                _ = conn.lifecycle_changed.notified() => {
+                    if !conn.active.load(Ordering::Acquire) {
+                        break;
+                    }
+                }
+                _ = async {
+                    deadline
+                        .as_mut()
+                        .expect("deadline branch is guarded")
+                        .as_mut()
+                        .await;
+                }, if deadline.is_some() && !deadline_expired => {
+                    deadline = None;
+                    let expired = Self::expire_connection(&conn);
+                    let rejected = matches!(
+                        *conn.certificate_authorization.read(),
+                        CertificateAuthorization::Rejected { .. }
+                    );
+                    if conn.active.load(Ordering::Acquire) && (expired || rejected) {
+                        deadline_expired = true;
+                        dispatching = Some(event_sink(VerifiedEventBatch::new(
+                            connection_id.clone(),
+                            Vec::new(),
+                        )));
+                    }
+                }
+                message = receivers.outgoing.recv(), if outgoing_open && emitting.is_none() && !deadline_expired => {
                     match message {
                         Some(message) => {
                             let message = PeerHandle::<W>::normalize_outbound(message);
-                            self.record_outbound_session_peer_identity(socket_id, &message).await;
+                            Self::record_outbound_session_peer_identity_for(&conn, &message).await;
                             emitting = Some(Box::pin(emit(message)));
                         }
                         None => outgoing_open = false,
                     }
                 }
-                message = receivers.general.recv(), if general_open && dispatching.is_none() => {
+                message = receivers.general.recv(), if general_open && dispatching.is_none() && !deadline_expired => {
                     match message {
                         Some((sender, payload)) => {
                             let Some((event_name, data)) = crate::wire::decode_event(&payload) else {
                                 continue;
                             };
-                            let events = self.admit_verified_event(
-                                socket_id,
+                            let events = self.admit_verified_event_for(
+                                &conn,
                                 VerifiedEvent { sender, event_name, data },
                             );
-                            if !events.is_empty() {
-                                dispatching = Some(event_sink(events));
+                            if conn.active.load(Ordering::Acquire) && !events.is_empty() {
+                                dispatching = Some(event_sink(VerifiedEventBatch::new(
+                                    connection_id.clone(),
+                                    events,
+                                )));
                             }
                         }
                         None => general_open = false,
@@ -876,9 +1092,16 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
 
     /// Bind an emitted responder handshake to the identity held by the SDK
     /// session identified by the nonce this server issued.
-    pub(crate) async fn record_outbound_session_peer_identity(
-        &self,
-        socket_id: &str,
+    #[cfg(test)]
+    async fn record_outbound_session_peer_identity(&self, socket_id: &str, message: &AuthMessage) {
+        let Some(conn) = self.conn(socket_id) else {
+            return;
+        };
+        Self::record_outbound_session_peer_identity_for(&conn, message).await;
+    }
+
+    async fn record_outbound_session_peer_identity_for(
+        conn: &Connection<W>,
         message: &AuthMessage,
     ) {
         if message.message_type != MessageType::InitialResponse {
@@ -887,32 +1110,37 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
         let Some(session_nonce) = message.initial_nonce.as_deref() else {
             return;
         };
-        let Some(conn) = self.conn(socket_id) else {
-            return;
-        };
         if let Some(identity_key) = conn
             .handle
             .peer()
             .session_peer_identity_for(session_nonce)
             .await
         {
-            Self::record_session_peer_identity(&conn, identity_key);
+            Self::record_session_peer_identity(conn, identity_key);
         }
     }
 
     /// Apply authorization state to one SDK-verified general event.
-    pub(crate) fn admit_verified_event(
-        &self,
-        socket_id: &str,
-        event: VerifiedEvent,
-    ) -> Vec<VerifiedEvent> {
+    #[cfg(test)]
+    fn admit_verified_event(&self, socket_id: &str, event: VerifiedEvent) -> Vec<VerifiedEvent> {
         let Some(conn) = self.conn(socket_id) else {
             return Vec::new();
         };
-        Self::expire_connection(&conn, true);
+        self.admit_verified_event_for(&conn, event)
+    }
+
+    fn admit_verified_event_for(
+        &self,
+        conn: &Connection<W>,
+        event: VerifiedEvent,
+    ) -> Vec<VerifiedEvent> {
+        if !conn.active.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        Self::expire_connection(conn);
         let mut events = vec![event];
-        self.gate_or_defer_events(socket_id, &conn, &mut events);
-        Self::record_admitted_identities(&conn, &events);
+        self.gate_or_defer_events(conn.id.socket_id(), conn, &mut events);
+        Self::record_admitted_identities(conn, &events);
         events
     }
 
@@ -967,7 +1195,6 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
                 .store(false, Ordering::SeqCst);
             deferred.clear();
             drop(authorization);
-            Self::abort_certificate_deadline_task(conn);
         }
     }
 
@@ -1002,7 +1229,6 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
                         .store(false, Ordering::SeqCst);
                     deferred.clear();
                     events.clear();
-                    Self::abort_certificate_deadline_task(conn);
                 }
             }
             CertificateAuthorization::Pending => {
@@ -1136,7 +1362,7 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
                     // authorizer. The terminal transition also releases retained
                     // events even for transport-agnostic Connection owners.
                     if let Some(conn) = weak_conn.upgrade() {
-                        Self::expire_connection(&conn, true);
+                        Self::expire_connection(&conn);
                     }
                     return Vec::new();
                 }
@@ -1171,7 +1397,6 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
         conn.certificate_authorizer_in_flight
             .store(false, Ordering::SeqCst);
         drop(authorization);
-        Self::abort_certificate_deadline_task(&conn);
         if accepted {
             let events = deferred.take();
             Self::record_admitted_identities(&conn, &events);
@@ -2507,6 +2732,57 @@ mod tests {
             1,
             "a retry must not start a concurrent policy lookup"
         );
+    }
+
+    #[tokio::test]
+    async fn superseded_authorizer_drops_deferred_events_before_sink_invocation() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let server_identity = identity_for_scalar(0x11).await;
+            let client = test_client(0x22).await;
+            let started = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let started_cb = started.clone();
+            let release_cb = release.clone();
+            let server = AuthSocketServer::new();
+            server.set_certificate_authorizer(move |_, _| {
+                let started = started_cb.clone();
+                let release = release_cb.clone();
+                async move {
+                    started.notify_one();
+                    release.notified().await;
+                    CertificateAuthorizationDecision::Accept
+                }
+            });
+            server.add_connection("sock1", wallet(0x11));
+            client_send(
+                &server,
+                "sock1",
+                &client,
+                "deferredFromOldConnection",
+                &json!({ "generation": "old" }),
+            )
+            .await;
+            let old_conn = server.conn("sock1").expect("retain old connection");
+
+            let certificate =
+                certificate_response_frame(&client, &server_identity, Vec::new()).await;
+            server.on_auth_message("sock1", certificate).await;
+            started.notified().await;
+
+            server.add_connection("sock1", wallet(0x11));
+            release.notify_one();
+
+            let mut old_pump = old_conn.test_pump.lock().await;
+            let old_pump = old_pump.as_mut().expect("old test pump");
+            let delivery =
+                tokio::time::timeout(Duration::from_millis(300), old_pump.released_rx.recv()).await;
+            assert!(
+                !matches!(delivery, Ok(Some(_))),
+                "superseded authorizer invoked its retained sink: {delivery:?}"
+            );
+        })
+        .await
+        .expect("superseded-authorizer regression must not hang");
     }
 
     #[tokio::test]

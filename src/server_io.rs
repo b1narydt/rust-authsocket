@@ -6,12 +6,12 @@
 //!
 //! - connect → [`AuthSocketServer::add_connection`] (fresh per-socket wallet
 //!   from the caller-supplied factory).
-//! - `"authMessage"` → parse → feed [`AuthSocketServer::on_auth_message`]. A
+//! - `"authMessage"` → parse → feed [`AuthSocketServer::on_auth_message_for`]. A
 //!   per-connection pump emits outbound frames and handles **generic room verbs**
 //!   (`authenticated`, `joinRoom` — including the "a client may only join its
 //!   own room" check — and `leaveRoom`), and hand every other verified event to
 //!   the caller-supplied [`AppDispatcher`].
-//! - disconnect → [`AuthSocketServer::remove_connection`].
+//! - disconnect → [`AuthSocketServer::remove_connection_if_current`].
 //!
 //! Application verbs (e.g. the MessageBox `sendMessage`) stay in the consumer,
 //! implemented on its [`AppDispatcher`]. Server→client pushes go through
@@ -85,41 +85,51 @@ pub fn attach<W, F, D>(
 
         // Register the BRC-103 session for this socket up front, so the first
         // inbound frame always finds its PeerHandle.
-        match wallet_factory() {
+        let connection_id = match wallet_factory() {
             Ok(wallet) => server.add_connection(&sid, wallet),
             Err(e) => {
                 warn!(sid = %sid, error = %e, "authsocket: wallet factory failed — closing socket");
                 socket.disconnect().ok();
                 return;
             }
-        }
+        };
 
-        let Some(receivers) = server.take_pump_receivers(&sid) else {
+        let Some(receivers) = server.take_pump_receivers_for(&connection_id) else {
             warn!(sid = %sid, "authsocket: connection pump receivers unavailable");
-            server.remove_connection(&sid);
-            socket.disconnect().ok();
+            if server.remove_connection_if_current(&connection_id) {
+                socket.disconnect().ok();
+            }
             return;
         };
         let weak_server = Arc::downgrade(&server);
         let sink_io = io_handle.clone();
-        let sink_sid = sid.clone();
+        let sink_socket = socket.clone();
         let sink_dispatcher = Arc::downgrade(&dispatcher);
         let sink_server = weak_server.clone();
-        let sink: VerifiedEventSink = Arc::new(move |events| {
+        let sink: VerifiedEventSink = Arc::new(move |batch| {
             let io = sink_io.clone();
-            let sid = sink_sid.clone();
+            let socket = sink_socket.clone();
             let dispatcher = sink_dispatcher.clone();
             let server = sink_server.clone();
+            let connection_id = batch.connection_id().clone();
+            let events = batch.into_events();
             Box::pin(async move {
+                let sid = connection_id.socket_id();
                 let Some(dispatcher) = dispatcher.upgrade() else {
                     error!(sid = %sid, count = events.len(),
                         "authsocket: verified events dropped because dispatcher is unavailable");
+                    if let Some(server) = server.upgrade() {
+                        if server.remove_connection_if_current(&connection_id) {
+                            socket.disconnect().ok();
+                        }
+                    }
                     return;
                 };
                 let dispatch = dispatch_admitted_events(
                     &io,
                     &server,
-                    &sid,
+                    &connection_id,
+                    &socket,
                     events,
                     dispatcher.as_ref(),
                 );
@@ -127,54 +137,43 @@ pub fn attach<W, F, D>(
                     error!(sid = %sid, panic = %panic_message(payload.as_ref()),
                         "authsocket: verified-event dispatcher panicked — closing connection");
                     if let Some(server) = server.upgrade() {
-                        server.remove_connection(&sid);
+                        if server.remove_connection_if_current(&connection_id) {
+                            socket.disconnect().ok();
+                        }
                     }
-                    disconnect_socket(&io, &sid);
                 }
             })
         });
-        server.set_verified_event_sink(&sid, &sink);
-        tokio::spawn(run_connection_pump(
-            io_handle.clone(),
+        if !server.set_verified_event_sink_for(&connection_id, &sink) {
+            warn!(sid = %sid, "authsocket: connection replaced before sink registration");
+            return;
+        }
+        tokio::spawn(run_socket_connection_pump(
             weak_server,
+            socket.clone(),
             sid.clone(),
             receivers,
             Arc::downgrade(&dispatcher),
             sink,
         ));
 
-        // Half-configuration is a connection-time terminal error, and Pending
-        // has a bounded lifetime. Close here (or from the deadline task) without
-        // waiting for another inbound frame to make the outcome observable.
-        if let Some(authorization) = server.certificate_authorization(&sid) {
+        // Half-configuration is a connection-time terminal error. Pending
+        // lifetime is bounded inside the transport-agnostic pump.
+        if let Some(authorization) = server.certificate_authorization_for(&connection_id) {
             if let Some(reason) = authorization.rejection_reason() {
                 warn!(sid = %sid, reason = %reason,
                     "authsocket: certificate configuration rejected connection — closing socket");
-                server.remove_connection(&sid);
-                socket.disconnect().ok();
+                if server.remove_connection_if_current(&connection_id) {
+                    socket.disconnect().ok();
+                }
                 return;
             }
-        }
-        if let Some(deadline) = server.certificate_authorization_deadline(&sid) {
-            let server_timeout = server.clone();
-            let socket_timeout = socket.clone();
-            let sid_timeout = sid.clone();
-            let deadline_task = tokio::spawn(async move {
-                tokio::time::sleep_until(deadline).await;
-                if server_timeout
-                    .expire_certificate_authorization_from_deadline(&sid_timeout)
-                {
-                    warn!(sid = %sid_timeout,
-                        "authsocket: certificate authorization deadline expired — closing socket");
-                    server_timeout.remove_connection(&sid_timeout);
-                    socket_timeout.disconnect().ok();
-                }
-            });
-            server.set_certificate_authorization_deadline_task(&sid, deadline_task);
         }
 
         let server_msg = server.clone();
         let server_dc = server.clone();
+        let connection_id_msg = connection_id.clone();
+        let connection_id_dc = connection_id.clone();
 
         // --- authMessage (BRC-103 mutual auth + general message routing) ---
         //
@@ -188,6 +187,7 @@ pub fn attach<W, F, D>(
             AUTH_MESSAGE_EVENT,
             move |socket: SocketRef, Data(data): Data<Value>| {
                 let server = server_msg.clone();
+                let connection_id = connection_id_msg.clone();
                 async move {
                     let sid = socket.id.to_string();
                     let incoming: AuthMessage = match serde_json::from_value(data) {
@@ -198,7 +198,7 @@ pub fn attach<W, F, D>(
                         }
                     };
 
-                    server.on_auth_message(&sid, incoming).await;
+                    server.on_auth_message_for(&connection_id, incoming).await;
                 }
             },
         );
@@ -207,9 +207,10 @@ pub fn attach<W, F, D>(
         socket.on_disconnect(
             move |socket: SocketRef, reason: socketioxide::socket::DisconnectReason| {
                 let server = server_dc.clone();
+                let connection_id = connection_id_dc.clone();
                 async move {
                     let sid = socket.id.to_string();
-                    server.remove_connection(&sid);
+                    server.remove_connection_if_current(&connection_id);
                     info!(sid = %sid, reason = ?reason, "authsocket: client disconnected");
                 }
             },
@@ -217,9 +218,9 @@ pub fn attach<W, F, D>(
     });
 }
 
-async fn run_connection_pump<W, D>(
-    io: SocketIo,
+async fn run_socket_connection_pump<W, D>(
     server: std::sync::Weak<AuthSocketServer<W>>,
+    socket: SocketRef,
     sid: String,
     receivers: PeerPumpReceivers,
     _dispatcher: std::sync::Weak<D>,
@@ -230,25 +231,17 @@ async fn run_connection_pump<W, D>(
 {
     let Some(server) = server.upgrade() else {
         warn!(sid = %sid, "authsocket: connection pump lost its server — closing socket");
-        disconnect_socket(&io, &sid);
+        socket.disconnect().ok();
         return;
     };
-    let emit_io = io.clone();
+    let connection_id = receivers.connection_id().clone();
+    let emit_socket = socket.clone();
     let emit_sid = sid.clone();
     let pump = server.run_connection_pump(&sid, receivers, move |message| {
-        let io = emit_io.clone();
+        let socket = emit_socket.clone();
         let sid = emit_sid.clone();
         async move {
-            let socket = sid
-                .parse()
-                .ok()
-                .and_then(|id| io.of("/").and_then(|ns| ns.get_socket(id)));
-            if let Some(socket) = socket {
-                emit_frame(&socket, &sid, &message);
-            } else {
-                warn!(sid = %sid,
-                    "authsocket: outbound signed frame dropped because socket lookup failed");
-            }
+            emit_frame(&socket, &sid, &message);
         }
     });
     match AssertUnwindSafe(pump).catch_unwind().await {
@@ -267,23 +260,38 @@ async fn run_connection_pump<W, D>(
     // No pump exit may leave an inert connection registered as live. This is
     // intentionally idempotent with both the disconnect callback and the
     // dispatcher-panic cleanup above.
-    server.remove_connection(&sid);
-    disconnect_socket(&io, &sid);
-}
-
-fn disconnect_socket(io: &SocketIo, sid: &str) {
-    let socket = sid
-        .parse()
-        .ok()
-        .and_then(|id| io.of("/").and_then(|namespace| namespace.get_socket(id)));
-    if let Some(socket) = socket {
+    let superseded = server.is_connection_superseded(&connection_id);
+    if server.remove_connection_if_current(&connection_id) || !superseded {
         if let Err(error) = socket.disconnect() {
             warn!(sid = %sid, error = %error,
                 "authsocket: failed to disconnect socket during pump teardown");
         }
     } else {
-        debug!(sid = %sid, "authsocket: pump teardown found socket already absent");
+        debug!(sid = %sid, generation = connection_id.generation(),
+            "authsocket: superseded pump exited without touching current connection");
     }
+}
+
+#[cfg(test)]
+async fn run_connection_pump<W, D>(
+    _io: SocketIo,
+    server: std::sync::Weak<AuthSocketServer<W>>,
+    sid: String,
+    receivers: PeerPumpReceivers,
+    _dispatcher: std::sync::Weak<D>,
+    _certificate_sink: VerifiedEventSink,
+) where
+    W: WalletInterface + Send + Sync + 'static,
+    D: AppDispatcher<W> + ?Sized + 'static,
+{
+    let Some(server) = server.upgrade() else {
+        return;
+    };
+    let connection_id = receivers.connection_id().clone();
+    let _ = server
+        .run_connection_pump(&sid, receivers, |_| async {})
+        .await;
+    server.remove_connection_if_current(&connection_id);
 }
 
 fn panic_message(payload: &(dyn Any + Send)) -> &str {
@@ -297,37 +305,41 @@ fn panic_message(payload: &(dyn Any + Send)) -> &str {
 async fn dispatch_admitted_events<W>(
     io: &SocketIo,
     server: &std::sync::Weak<AuthSocketServer<W>>,
-    sid: &str,
+    connection_id: &crate::server::ConnectionId,
+    socket: &SocketRef,
     events: Vec<VerifiedEvent>,
     dispatcher: &(impl AppDispatcher<W> + ?Sized),
 ) where
     W: WalletInterface + Send + Sync + 'static,
 {
+    let sid = connection_id.socket_id();
     let Some(server) = server.upgrade() else {
         error!(sid = %sid, count = events.len(),
             "authsocket: admitted events dropped because server is unavailable");
         return;
     };
-    let socket = sid
-        .parse()
-        .ok()
-        .and_then(|id| io.of("/").and_then(|ns| ns.get_socket(id)));
-    let Some(socket) = socket else {
-        warn!(sid = %sid, count = events.len(),
-            "authsocket: admitted events dropped because socket lookup failed");
+    if !server.is_current_connection(connection_id) {
+        debug!(sid = %sid, generation = connection_id.generation(), count = events.len(),
+            "authsocket: superseded verified-event batch dropped");
         return;
-    };
-    if let Some(authorization) = server.certificate_authorization(sid) {
+    }
+    if let Some(authorization) = server.certificate_authorization_for(connection_id) {
         if let Some(reason) = authorization.rejection_reason() {
             warn!(sid = %sid, reason = %reason,
                 "authsocket: certificate authorization rejected — closing socket");
-            server.remove_connection(sid);
-            socket.disconnect().ok();
+            if server.remove_connection_if_current(connection_id) {
+                socket.clone().disconnect().ok();
+            }
             return;
         }
     }
     for event in events {
-        handle_verified_event(io, &server, &socket, sid, event, dispatcher).await;
+        if !server.is_current_connection(connection_id) {
+            debug!(sid = %sid, generation = connection_id.generation(),
+                "authsocket: remaining superseded verified events dropped");
+            return;
+        }
+        handle_verified_event(io, &server, socket, sid, event, dispatcher).await;
     }
 }
 

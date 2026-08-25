@@ -224,3 +224,188 @@ async fn connection_pump_without_verified_event_sink_is_a_loud_error() {
         ConnectionPumpError::VerifiedEventSinkNotRegistered(SID.to_string())
     );
 }
+
+#[tokio::test]
+async fn replacement_survives_old_pump_teardown_and_still_receives_frames() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let server = Arc::new(AuthSocketServer::new());
+        let old_id = server.add_connection(SID, wallet(SERVER_KEY));
+        let old_receivers = server.take_pump_receivers(SID).expect("old pump receivers");
+        let old_sink: VerifiedEventSink = Arc::new(|_| Box::pin(async {}));
+        server.set_verified_event_sink(SID, &old_sink);
+        let old_server = server.clone();
+        let old_pump = tokio::spawn(async move {
+            old_server
+                .run_connection_pump(SID, old_receivers, |_| async {})
+                .await
+        });
+
+        let mut replacement = ChannelConsumer::start(server.clone()).await;
+        tokio::time::timeout(Duration::from_secs(2), old_pump)
+            .await
+            .expect("replacing the connection closes the old pump")
+            .expect("old pump task does not panic")
+            .expect("old pump exits successfully");
+
+        assert!(
+            !server.remove_connection_if_current(&old_id),
+            "old teardown must not remove the replacement"
+        );
+        replacement
+            .peer
+            .send_message(
+                "",
+                encode_event("replacementLive", &json!({ "generation": "new" })),
+            )
+            .await
+            .expect("replacement still receives pump frames");
+        let event = replacement.events.recv().await.expect("replacement event");
+        assert_eq!(event.event_name, "replacementLive");
+        assert_eq!(event.data, json!({ "generation": "new" }));
+
+        replacement.stop().await;
+    })
+    .await
+    .expect("replacement teardown regression must not hang");
+}
+
+#[tokio::test]
+async fn deferred_events_from_a_superseded_connection_are_dropped_before_any_sink() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let server = Arc::new(AuthSocketServer::new());
+        let authorizer_started = Arc::new(tokio::sync::Notify::new());
+        let release_authorizer = Arc::new(tokio::sync::Notify::new());
+        let started = authorizer_started.clone();
+        let release = release_authorizer.clone();
+        server.set_certificate_authorizer(move |_, _| {
+            let started = started.clone();
+            let release = release.clone();
+            async move {
+                started.notify_one();
+                release.notified().await;
+                CertificateAuthorizationDecision::Accept
+            }
+        });
+
+        let mut old = ChannelConsumer::start(server.clone()).await;
+        old.peer
+            .send_message(
+                "",
+                encode_event("oldDeferred", &json!({ "generation": "old" })),
+            )
+            .await
+            .expect("old connection sends deferred event");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), old.events.recv())
+                .await
+                .is_err(),
+            "the old event must be buffered while authorization is pending"
+        );
+        old.peer
+            .send_certificate_response(&identity_of(SERVER_KEY).await, Vec::new())
+            .await
+            .expect("old connection starts authorization");
+        authorizer_started.notified().await;
+
+        let mut replacement = ChannelConsumer::start(server.clone()).await;
+        release_authorizer.notify_one();
+
+        let old_delivery =
+            tokio::time::timeout(Duration::from_millis(300), old.events.recv()).await;
+        assert!(
+            !matches!(old_delivery, Ok(Some(_))),
+            "a superseded connection must not invoke even its retained sink: {old_delivery:?}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), replacement.events.recv())
+                .await
+                .is_err(),
+            "old deferred events must not reach replacement state"
+        );
+
+        old.inbound.abort();
+        tokio::time::timeout(Duration::from_secs(2), old.pump)
+            .await
+            .expect("old pump exits after authorization releases")
+            .expect("old pump task does not panic")
+            .expect("old pump exits successfully");
+        replacement.stop().await;
+    })
+    .await
+    .expect("superseded deferred-event regression must not hang");
+}
+
+#[tokio::test]
+async fn transport_agnostic_pump_enforces_certificate_deadline() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let server = Arc::new(AuthSocketServer::new());
+        server.set_certificate_authorizer(|_, _| async move {
+            CertificateAuthorizationDecision::Accept
+        });
+        server.set_certificate_authorization_timeout(Duration::from_millis(50));
+        let connection_id = server.add_connection(SID, wallet(SERVER_KEY));
+        let receivers = server
+            .take_pump_receivers(SID)
+            .expect("deadline pump receivers");
+        let sink: VerifiedEventSink = Arc::new(|_| Box::pin(async {}));
+        server.set_verified_event_sink(SID, &sink);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            server.run_connection_pump(SID, receivers, |_| async {}),
+        )
+        .await
+        .expect("pump exits when no certificate response arrives")
+        .expect("deadline is a normal pump teardown");
+        assert!(
+            !server.is_current_connection(&connection_id),
+            "deadline removes the transport-agnostic connection"
+        );
+    })
+    .await
+    .expect("transport-agnostic deadline regression must not hang");
+}
+
+#[tokio::test]
+async fn transport_agnostic_pump_keeps_connection_that_answers_before_deadline() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let server = Arc::new(AuthSocketServer::new());
+        server.set_certificate_authorizer(|_, _| async move {
+            CertificateAuthorizationDecision::Accept
+        });
+        server.set_certificate_authorization_timeout(Duration::from_secs(1));
+        let mut consumer = ChannelConsumer::start(server.clone()).await;
+
+        consumer
+            .peer
+            .send_message(
+                "",
+                encode_event("answered", &json!({ "before": "deadline" })),
+            )
+            .await
+            .expect("send deferred event");
+        consumer
+            .peer
+            .send_certificate_response(&identity_of(SERVER_KEY).await, Vec::new())
+            .await
+            .expect("answer before deadline");
+        let admitted = consumer.events.recv().await.expect("authorized event");
+        assert_eq!(admitted.event_name, "answered");
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        consumer
+            .peer
+            .send_message(
+                &identity_of(SERVER_KEY).await,
+                encode_event("stillLive", &json!({ "after": "deadline" })),
+            )
+            .await
+            .expect("accepted connection remains live after original deadline");
+        let live = consumer.events.recv().await.expect("post-deadline event");
+        assert_eq!(live.event_name, "stillLive");
+
+        consumer.stop().await;
+    })
+    .await
+    .expect("answered-deadline regression must not hang");
+}
