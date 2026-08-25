@@ -28,7 +28,6 @@ use bsv::auth::types::AuthMessage;
 #[cfg(feature = "server")]
 use bsv::auth::types::RequestedCertificateSet;
 use bsv::wallet::interfaces::WalletInterface;
-#[cfg(feature = "server")]
 use parking_lot::Mutex as SyncMutex;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -65,10 +64,12 @@ pub type VerifiedGeneralMessage = (String, Vec<u8>);
 pub type GeneralMessageReceiver = mpsc::Receiver<VerifiedGeneralMessage>;
 
 /// Take-once observer receivers owned by a connection's long-lived pump.
-#[cfg(feature = "server")]
 pub struct PeerPumpReceivers {
     pub outgoing: mpsc::Receiver<AuthMessage>,
     pub general: GeneralMessageReceiver,
+    /// Server-registry identity of the connection these receivers belong to.
+    /// Absent on a client-side `PeerHandle`, which has no connection registry.
+    #[cfg(feature = "server")]
     pub(crate) connection_id: Option<crate::server::ConnectionId>,
 }
 
@@ -90,15 +91,11 @@ pub struct PeerHandle<W: WalletInterface + 'static> {
     incoming_tx: mpsc::Sender<AuthMessage>,
     /// Drain Peer → Socket.IO frames here (then `emit` each as `"authMessage"`).
     ///
-    /// Server-only: `take_pump_receivers` is the sole reader, and the client
-    /// backend drives its own `Peer` directly rather than through a pump. On a
-    /// client build these would be an allocated receiver nothing ever drains —
-    /// the transport's outbound channel held open with no consumer.
-    #[cfg(feature = "server")]
+    /// Read by `take_pump_receivers` in every configuration — a client
+    /// consumer pumps its own `PeerHandle` too.
     outgoing_rx: SyncMutex<Option<mpsc::Receiver<AuthMessage>>>,
     /// Decoded, verified BRC-103 general-message payloads with their verified
-    /// sender key (app events). Server-only, for the same reason.
-    #[cfg(feature = "server")]
+    /// sender key (app events).
     general_rx: SyncMutex<Option<GeneralMessageReceiver>>,
     /// Serializes server-side certificate response production on this peer.
     #[cfg(feature = "server")]
@@ -131,10 +128,7 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
         wallet: W,
         #[cfg(feature = "server")] requested: Option<RequestedCertificateSet>,
     ) -> Self {
-        #[cfg(feature = "server")]
         let (transport, incoming_tx, outgoing_rx) = ChannelTransport::new();
-        #[cfg(not(feature = "server"))]
-        let (transport, incoming_tx, _outgoing_rx) = ChannelTransport::new();
         let transport = Arc::new(transport);
         let peer = Peer::new(wallet, transport.clone());
         #[cfg(feature = "server")]
@@ -142,17 +136,9 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
             peer.set_certificates_to_request(requested);
         }
         // Take-once: must be called on the fresh Peer before it is stored.
-        #[cfg(feature = "server")]
         let general_rx = peer
             .on_general_message()
             .expect("on_general_message must succeed on a fresh Peer");
-        // Client builds never pump, so take and drop the observer rather than
-        // leaving the SDK's bounded channel with a receiver nothing drains.
-        #[cfg(not(feature = "server"))]
-        drop(
-            peer.on_general_message()
-                .expect("on_general_message must succeed on a fresh Peer"),
-        );
         // The certificate-request observer is unused. Take and drop it so the
         // SDK's bounded observer channel can never retain stale notifications.
         drop(
@@ -174,9 +160,7 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
         Self {
             peer,
             incoming_tx,
-            #[cfg(feature = "server")]
             outgoing_rx: SyncMutex::new(Some(outgoing_rx)),
-            #[cfg(feature = "server")]
             general_rx: SyncMutex::new(Some(general_rx)),
             #[cfg(feature = "server")]
             certificate_io: Mutex::new(()),
@@ -263,13 +247,23 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
     }
 
     /// Transfer observer ownership to the one long-lived connection pump.
-    #[cfg(feature = "server")]
-    pub(crate) fn take_pump_receivers(&self) -> Option<PeerPumpReceivers> {
+    ///
+    /// Take-once, and **mandatory**: `PeerHandle` has no other way to surface
+    /// outbound frames or verified events, and an un-pumped handle wedges once
+    /// the transport's bounded outbound channel fills. Returns `None` on a
+    /// second call.
+    ///
+    /// Available to client consumers as well as server ones. `mpc-enterprise-
+    /// wallet` drives a client-side wallet lane through `PeerHandle` directly,
+    /// so gating this on the `server` feature leaves that configuration able to
+    /// `feed` frames in with no way to get anything back.
+    pub fn take_pump_receivers(&self) -> Option<PeerPumpReceivers> {
         let outgoing = self.outgoing_rx.lock().take()?;
         let general = self.general_rx.lock().take()?;
         Some(PeerPumpReceivers {
             outgoing,
             general,
+            #[cfg(feature = "server")]
             connection_id: None,
         })
     }
