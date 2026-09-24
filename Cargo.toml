@@ -43,3 +43,8 @@ tokio = { version = "1", features = ["full", "test-util"] }
 # client, over loopback (tests/e2e.rs, requires --features server,client).
 axum = "0.8"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ATLAS #12: the certificate-less admission path needs the SDK to hand an empty
+# proof batch to a configured authorizer (b1narydt/bsv-rust-sdk#56).
+[patch.crates-io]
+bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk", rev = "ba61a7f603ead1a6dfbf3b370c0741301e09ccab" }

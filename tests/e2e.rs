@@ -15,7 +15,9 @@ use socketioxide::extract::{Data, SocketRef};
 use socketioxide::SocketIo;
 use tokio::sync::mpsc;
 
-use authsocket::client::{parse_auth_message_from_payload, AuthSocketClient, SocketIOTransport};
+use authsocket::client::{
+    parse_auth_message_from_payload, AuthSocketClient, CertificateProvider, SocketIOTransport,
+};
 use authsocket::peer_session::VerifiedEvent;
 use authsocket::server::{
     AuthSocketServer, CertificateAuthorizationDecision, SharedAuthSocketServer,
@@ -720,6 +722,54 @@ async fn authsocket_client_completes_with_slow_accepting_certificate_authorizer(
     assert!(client.is_connected());
     assert!(authorizer_called.load(Ordering::SeqCst));
     client.disconnect().await.expect("disconnect");
+}
+
+/// A client holding no certificate answers the request with `[]` (as the TS
+/// client does); whether it is admitted is the server authorizer's decision.
+#[tokio::test]
+async fn certificate_less_client_is_admitted_when_the_authorizer_accepts_the_empty_batch() {
+    let server_identity = identity_of(SERVER_KEY).await;
+    let client_identity = identity_of(CLIENT_KEY).await;
+    for accept in [true, false] {
+        let core: SharedAuthSocketServer<ProtoWallet> = Arc::new(AuthSocketServer::new());
+        core.set_certificates_to_request(membership_request(server_identity.clone()));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(String, usize)>::new()));
+        let seen_cb = seen.clone();
+        core.set_certificate_authorizer(move |identity, certificates| {
+            let seen = seen_cb.clone();
+            async move {
+                seen.lock().unwrap().push((identity, certificates.len()));
+                if accept && certificates.is_empty() {
+                    CertificateAuthorizationDecision::Accept
+                } else {
+                    CertificateAuthorizationDecision::Reject("no delegation record".into())
+                }
+            }
+        });
+        let (url, _core, _dispatched) = boot_server_with_core(core).await;
+        let wallet = ProtoWallet::new(PrivateKey::from_hex(CLIENT_KEY).expect("client key"));
+        let provider: CertificateProvider = Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) }));
+        let result = AuthSocketClient::connect_with_certificate_provider(
+            &url,
+            &client_identity,
+            wallet,
+            provider,
+        )
+        .await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(client_identity.clone(), 0)],
+            "the authorizer sees the session identity and an empty batch (accept={accept})"
+        );
+        match result {
+            Ok(client) => {
+                assert!(accept, "a rejected empty batch must not connect");
+                assert!(client.is_connected());
+                client.disconnect().await.expect("disconnect");
+            }
+            Err(error) => assert!(!accept, "an accepted empty batch must connect: {error}"),
+        }
+    }
 }
 
 #[tokio::test]

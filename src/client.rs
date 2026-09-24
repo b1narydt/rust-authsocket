@@ -650,10 +650,11 @@ impl AuthSocketClient {
                 let peer = peer_for_certificates.clone();
                 let result_tx = certificate_result_tx.clone();
                 tokio::spawn(async move {
+                    // An empty batch is sent as `[]`, as the TS Peer sends
+                    // it: a client holding no certificate answers the request
+                    // and the server's authorizer decides (certificate-less
+                    // admission against a record the server holds).
                     let result = match provider(verifier.clone(), requested).await {
-                        Ok(certificates) if certificates.is_empty() => {
-                            Err("certificate provider returned an empty batch".to_string())
-                        }
                         Ok(certificates) => peer
                             .send_certificate_response(&verifier, certificates)
                             .await
