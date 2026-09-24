@@ -134,6 +134,16 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
         #[cfg(feature = "server")]
         if let Some(requested) = requested {
             peer.set_certificates_to_request(requested);
+            // The SDK completes a certificate exchange for an empty batch only
+            // when an SDK-level authorizer is configured. Admission on this
+            // server is decided by [`crate::server::AuthSocketServer`]'s own
+            // authorizer, after the SDK's structural validation and behind the
+            // deferred-event gate, so the SDK-level decision is "structurally
+            // valid ⇒ continue": it lets an empty batch reach that authorizer
+            // instead of leaving the SDK session pending forever.
+            peer.set_certificate_authorizer(Arc::new(|_context| {
+                Box::pin(async { bsv::auth::CertificateAuthorizationDecision::Accept })
+            }));
         }
         // Take-once: must be called on the fresh Peer before it is stored.
         let general_rx = peer

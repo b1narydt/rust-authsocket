@@ -340,9 +340,6 @@ struct Connection<W: WalletInterface + 'static> {
     /// this separate from the weak callback reference also lets internal test
     /// pumps retain their deliberately scoped sink ownership.
     owned_verified_event_sink: RwLock<Option<VerifiedEventSink>>,
-    /// The SDK defers general dispatch until this connection's requested
-    /// certificates validate.
-    sdk_certificate_gate: bool,
     #[cfg(test)]
     test_pump: tokio::sync::Mutex<Option<TestPumpState>>,
 }
@@ -544,9 +541,6 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
             generation,
         };
         let requested = self.certificates_to_request.read().clone();
-        let sdk_certificate_gate = requested
-            .as_ref()
-            .is_some_and(|requested| !requested.certifiers.is_empty());
         let authorizer = self.certificate_authorizer.read().clone();
         let has_authorizer = authorizer.is_some();
         let authorization_timeout = *self.certificate_authorization_timeout.read();
@@ -589,7 +583,6 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
             certificate_request_bridge_id: RwLock::new(None),
             verified_event_sink: RwLock::new(None),
             owned_verified_event_sink: RwLock::new(None),
-            sdk_certificate_gate,
             #[cfg(test)]
             test_pump: tokio::sync::Mutex::new(None),
         });
@@ -1311,14 +1304,11 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
                 return Vec::new();
             }
 
-            if conn.sdk_certificate_gate && certificates.is_empty() {
-                Self::reject_pending_with_deferred(
-                    &conn,
-                    &mut deferred,
-                    "certificate response contained no certificates".into(),
-                );
-                return Vec::new();
-            }
+            // An empty batch is handed to the authorizer like any other: a
+            // peer holding no certificate answers the request with `[]`, and
+            // whether that peer is admitted against a record the application
+            // holds is the application's decision. The default authorizer of a
+            // server that never admits certificate-less peers rejects it.
 
             // Pending means no terminal decision exists, but it no longer
             // implies that no authorizer is running. Claim the single allowed
@@ -3424,8 +3414,75 @@ mod tests {
         .expect("ordered events must arrive without an extra sentinel frame");
     }
 
+    /// An empty batch reaches the authorizer with the session identity, and
+    /// `Accept` admits the peer without a certificate: events deferred while
+    /// pending are released and the connection carries the peer's identity.
     #[tokio::test]
-    async fn empty_requested_certificate_batch_is_rejected_before_authorizer() {
+    async fn empty_certificate_batch_is_decided_by_the_authorizer() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let server_identity = identity_for_scalar(0x11).await;
+            let client = test_client(0x22).await;
+            client
+                .peer
+                .listen_for_certificates_requested(Arc::new(|_, _| {}));
+            let seen = Arc::new(std::sync::Mutex::new(Vec::<(String, usize)>::new()));
+            let seen_cb = seen.clone();
+            let server = AuthSocketServer::new();
+            server.set_certificates_to_request(requested_certificates(server_identity.clone()));
+            server.set_certificate_authorizer(move |identity, certificates| {
+                let seen = seen_cb.clone();
+                async move {
+                    seen.lock()
+                        .expect("seen mutex")
+                        .push((identity, certificates.len()));
+                    if certificates.is_empty() {
+                        CertificateAuthorizationDecision::Accept
+                    } else {
+                        CertificateAuthorizationDecision::Reject("unexpected certificate".into())
+                    }
+                }
+            });
+            server.add_connection("sock1", wallet(0x11));
+            let events =
+                client_send_collect(&server, "sock1", &client, "pending", &json!({})).await;
+            assert!(
+                events.is_empty(),
+                "pending event must initially be withheld"
+            );
+
+            let released =
+                send_certificates_collect(&server, "sock1", &client, &server_identity, Vec::new())
+                    .await;
+            assert_eq!(released.len(), 1, "accept must release the deferred event");
+            assert_eq!(released[0].event_name, "pending");
+            assert_eq!(
+                *seen.lock().expect("seen mutex"),
+                vec![(client.identity.clone(), 0)],
+                "the authorizer receives the session identity and an empty batch"
+            );
+            assert_eq!(
+                server.certificate_authorization("sock1"),
+                Some(CertificateAuthorization::Accepted {
+                    identity_key: client.identity.clone()
+                })
+            );
+            let events =
+                client_send_collect(&server, "sock1", &client, "authenticated", &json!({})).await;
+            assert_eq!(
+                events.len(),
+                1,
+                "an admitted certificate-less peer may proceed"
+            );
+            assert_eq!(server.identity_key("sock1"), Some(client.identity.clone()));
+        })
+        .await
+        .expect("empty certificate batch admission must complete");
+    }
+
+    /// `Reject` on an empty batch is terminal: no identity, no released
+    /// events, and the reason is the authorizer's.
+    #[tokio::test]
+    async fn empty_certificate_batch_rejected_by_the_authorizer_stays_rejected() {
         tokio::time::timeout(Duration::from_secs(10), async {
             let server_identity = identity_for_scalar(0x11).await;
             let client = test_client(0x22).await;
@@ -3436,19 +3493,25 @@ mod tests {
             let invocations_cb = invocations.clone();
             let server = AuthSocketServer::new();
             server.set_certificates_to_request(requested_certificates(server_identity.clone()));
-            server.set_certificate_authorizer(move |_, _| {
+            server.set_certificate_authorizer(move |_, certificates| {
                 invocations_cb.fetch_add(1, Ordering::SeqCst);
-                async { CertificateAuthorizationDecision::Accept }
+                async move {
+                    assert!(certificates.is_empty());
+                    CertificateAuthorizationDecision::Reject("no delegation record".into())
+                }
             });
             server.add_connection("sock1", wallet(0x11));
             client_send(&server, "sock1", &client, "pending", &json!({})).await;
 
-            send_certificates(&server, "sock1", &client, &server_identity, Vec::new()).await;
-            assert_eq!(invocations.load(Ordering::SeqCst), 0);
+            let released =
+                send_certificates_collect(&server, "sock1", &client, &server_identity, Vec::new())
+                    .await;
+            assert!(released.is_empty());
+            assert_eq!(invocations.load(Ordering::SeqCst), 1);
             assert!(matches!(
                 server.certificate_authorization("sock1"),
                 Some(CertificateAuthorization::Rejected { reason, .. })
-                    if reason.contains("no certificates")
+                    if reason == "no delegation record"
             ));
             assert_eq!(server.identity_key("sock1"), None);
         })
