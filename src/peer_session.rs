@@ -24,6 +24,8 @@ use bsv::auth::error::AuthError;
 use bsv::auth::peer::Peer;
 #[cfg(feature = "server")]
 use bsv::auth::peer::{OnCertificateRequestReceived, OnCertificatesReceived};
+#[cfg(feature = "server")]
+use bsv::auth::session_manager::{SessionManager, DEFAULT_SEEN_NONCE_CAP};
 use bsv::auth::types::AuthMessage;
 #[cfg(feature = "server")]
 use bsv::auth::types::RequestedCertificateSet;
@@ -36,6 +38,27 @@ use tokio::sync::Mutex;
 
 use crate::transport::ChannelTransport;
 use crate::wire::encode_event;
+
+/// The session lifetime for a server `PeerHandle` that is owned by one
+/// Socket.IO connection.
+///
+/// The connection registry drops the whole handle on transport disconnect or
+/// replacement, so idle expiry is neither the ownership boundary nor needed
+/// to bound its lifetime. Keeping this separate from the SDK default is
+/// essential: HTTP and shared-peer callers still need idle expiry to evict
+/// detached sessions. Replay state remains bounded by the SDK's per-session
+/// nonce cap; the SDK `Peer` (rather than `SessionManager` itself) admits
+/// handshakes through its 1,024-session LRU cap.
+#[cfg(feature = "server")]
+const CONNECTION_LIFETIME_SESSION_IDLE_TTL_MS: u64 = u64::MAX;
+
+#[cfg(feature = "server")]
+fn connection_lifetime_session_manager() -> SessionManager {
+    SessionManager::with_config(
+        CONNECTION_LIFETIME_SESSION_IDLE_TTL_MS,
+        DEFAULT_SEEN_NONCE_CAP,
+    )
+}
 
 /// A verified application event decoded from a BRC-103 general message.
 ///
@@ -110,7 +133,7 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
     pub fn new(wallet: W) -> Self {
         #[cfg(feature = "server")]
         {
-            Self::build(wallet, None)
+            Self::build(wallet, None, false)
         }
         #[cfg(not(feature = "server"))]
         {
@@ -119,17 +142,34 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
     }
 
     /// Internal server construction path.
+    ///
+    /// The server owns this handle for exactly one Socket.IO connection. Its
+    /// session store therefore lives until that connection is removed, rather
+    /// than applying the SDK's process-wide idle-session policy. This must not
+    /// be used for client or shared-peer handles.
     #[cfg(feature = "server")]
     pub(crate) fn new_for_server(wallet: W, requested: Option<RequestedCertificateSet>) -> Self {
-        Self::build(wallet, requested)
+        Self::build(wallet, requested, true)
     }
 
     fn build(
         wallet: W,
         #[cfg(feature = "server")] requested: Option<RequestedCertificateSet>,
+        #[cfg(feature = "server")] server_connection_owned: bool,
     ) -> Self {
         let (transport, incoming_tx, outgoing_rx) = ChannelTransport::new();
         let transport = Arc::new(transport);
+        #[cfg(feature = "server")]
+        let peer = if server_connection_owned {
+            Peer::with_session_manager(
+                wallet,
+                transport.clone(),
+                connection_lifetime_session_manager(),
+            )
+        } else {
+            Peer::new(wallet, transport.clone())
+        };
+        #[cfg(not(feature = "server"))]
         let peer = Peer::new(wallet, transport.clone());
         #[cfg(feature = "server")]
         if let Some(requested) = requested {
@@ -292,5 +332,51 @@ impl<W: WalletInterface + 'static> PeerHandle<W> {
     #[cfg(all(test, feature = "server"))]
     pub(crate) async fn lock_certificate_io_for_test(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.certificate_io.lock().await
+    }
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+    use bsv::auth::session_manager::{MarkSeen, DEFAULT_SESSION_IDLE_TTL_MS};
+    use bsv::auth::types::PeerSession;
+
+    fn authenticated_session() -> PeerSession {
+        PeerSession {
+            session_nonce: "connection-session".into(),
+            peer_identity_key: "connection-peer".into(),
+            peer_nonce: "peer-nonce".into(),
+            is_authenticated: true,
+            requested_certificates: None,
+            certificates_required: false,
+            certificates_validated: true,
+        }
+    }
+
+    #[test]
+    fn server_connection_session_manager_keeps_idle_sessions_and_replay_guard() {
+        let mut sessions = connection_lifetime_session_manager();
+        let session = authenticated_session();
+        sessions.add_session(session);
+        sessions.touch("connection-session", 1);
+
+        assert!(
+            sessions
+                .get_active_session(
+                    "connection-peer",
+                    1 + DEFAULT_SESSION_IDLE_TTL_MS + 1,
+                )
+                .is_some(),
+            "a server-owned session is owned by its live Socket.IO connection, not the SDK idle TTL",
+        );
+        assert_eq!(
+            sessions.mark_message_seen("connection-session", "message-nonce", 2),
+            MarkSeen::Fresh,
+        );
+        assert_eq!(
+            sessions.mark_message_seen("connection-session", "message-nonce", 3),
+            MarkSeen::Replay,
+            "connection-lifetime sessions retain the SDK replay guard",
+        );
     }
 }
