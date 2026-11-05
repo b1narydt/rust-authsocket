@@ -3540,6 +3540,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn removing_an_authenticated_connection_revokes_room_routability() {
+        let server = AuthSocketServer::new();
+        let connection = server.add_connection("sock1", wallet(0x11));
+        let client = test_client(0x22).await;
+
+        client_send(&server, "sock1", &client, "authenticated", &json!({})).await;
+        server.join_room("sock1", "roomA");
+        assert_eq!(
+            server
+                .emit_to_room("roomA", "sendMessage-roomA", &json!({"x": 1}))
+                .await
+                .len(),
+            1,
+        );
+
+        assert!(server.remove_connection_if_current(&connection));
+        assert!(server.room_members("roomA").is_empty());
+        assert!(
+            server
+                .emit_to_room("roomA", "sendMessage-roomA", &json!({"x": 2}))
+                .await
+                .is_empty(),
+            "a disconnected Socket.IO generation owns no routable session",
+        );
+    }
+
+    #[tokio::test]
     async fn room_membership_lifecycle() {
         let server: AuthSocketServer<ProtoWallet> = AuthSocketServer::new();
         server.add_connection("sock1", wallet(0x11));
