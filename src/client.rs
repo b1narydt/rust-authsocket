@@ -43,7 +43,7 @@ use bsv::auth::certificates::VerifiableCertificate;
 use bsv::auth::error::AuthError;
 use bsv::auth::peer::Peer;
 use bsv::auth::transports::Transport;
-use bsv::auth::types::{AuthMessage, MessageType, RequestedCertificateSet};
+use bsv::auth::types::{AuthMessage, MessageType, PeerSession, RequestedCertificateSet};
 use bsv::wallet::interfaces::WalletInterface;
 
 use crate::wire::{decode_event, encode_event, AUTH_MESSAGE_EVENT};
@@ -174,6 +174,9 @@ impl std::error::Error for ClientError {}
 
 /// Exact-match event handler: receives the verified event's `data`.
 pub type EventHandler = Arc<dyn Fn(Value) + Send + Sync>;
+/// Exact-match event handler that also receives the event's BRC-103-verified
+/// sender key (always the connected server: the client drops everything else).
+pub type VerifiedEventHandler = Arc<dyn Fn(String, Value) + Send + Sync>;
 /// Fallback handler for events without an exact-match handler:
 /// `(event_name, data)`.
 pub type FallbackHandler = Arc<dyn Fn(String, Value) + Send + Sync>;
@@ -191,7 +194,18 @@ pub type CertificateProvider = Arc<
         + Sync,
 >;
 
-type HandlerMap = Arc<Mutex<HashMap<String, EventHandler>>>;
+/// One registered exact-match handler.
+#[derive(Clone)]
+enum Handler {
+    Data(EventHandler),
+    Verified(VerifiedEventHandler),
+}
+
+type HandlerMap = Arc<Mutex<HashMap<String, Handler>>>;
+/// The server identity this client authenticated, set once the handshake
+/// session exists. Every inbound frame and every verified event is checked
+/// against it.
+type PinnedServer = Arc<parking_lot::RwLock<Option<String>>>;
 type AuthSuccessSender = Arc<Mutex<Option<oneshot::Sender<Result<(), String>>>>>;
 
 /// Type-erased BRC-103 signer.
@@ -491,8 +505,8 @@ impl AuthSocketClient {
 
         // Incoming BRC-103 authMessage events → SocketIOTransport → Peer.
         let (auth_msg_tx, auth_msg_rx) = mpsc::channel(64);
-        // Server identity key captured from the handshake frames.
-        let (server_key_tx, mut server_key_rx) = mpsc::channel::<String>(1);
+        // The server identity, pinned from the authenticated handshake session.
+        let pinned_server: PinnedServer = Arc::new(parking_lot::RwLock::new(None));
         // authenticationSuccess oneshot (fired by the dispatcher).
         let (auth_success_tx, auth_success_rx) = oneshot::channel::<Result<(), String>>();
         let auth_success_shared: AuthSuccessSender = Arc::new(Mutex::new(Some(auth_success_tx)));
@@ -518,7 +532,7 @@ impl AuthSocketClient {
         let connect_ready_tx_cb = connect_ready_tx.clone();
 
         let auth_msg_tx_clone = auth_msg_tx.clone();
-        let server_key_tx_clone = server_key_tx.clone();
+        let pinned_for_auth = pinned_server.clone();
         let last_inbound_for_auth = last_inbound_ms.clone();
         let certificate_requested_for_auth = certificate_requested.clone();
 
@@ -529,7 +543,7 @@ impl AuthSocketClient {
         let client = ClientBuilder::new(url)
             .on(AUTH_MESSAGE_EVENT, move |payload, _socket| {
                 let tx = auth_msg_tx_clone.clone();
-                let key_tx = server_key_tx_clone.clone();
+                let pinned = pinned_for_auth.clone();
                 let last_inbound = last_inbound_for_auth.clone();
                 let certificate_requested = certificate_requested_for_auth.clone();
                 async move {
@@ -545,14 +559,25 @@ impl AuthSocketClient {
                         {
                             certificate_requested.store(true, Ordering::SeqCst);
                         }
-                        // Capture the server identity key from the handshake
-                        // frames so it can be retrieved after the handshake
-                        // completes (the Peer itself verifies it during
-                        // complete_handshake).
-                        if msg.message_type == MessageType::InitialRequest
-                            || msg.message_type == MessageType::InitialResponse
-                        {
-                            let _ = key_tx.send(msg.identity_key.clone()).await;
+                        // rust-mpc#458 D3: this client initiates its one
+                        // session and never answers a handshake it did not
+                        // start (a server never initiates one). A frame that
+                        // only claims an identity therefore cannot open a
+                        // second session, and once the server is pinned no
+                        // frame from any other identity reaches the Peer.
+                        if msg.message_type == MessageType::InitialRequest {
+                            tracing::warn!(claimed = %msg.identity_key,
+                                "authsocket client: refused an unsolicited initialRequest");
+                            return;
+                        }
+                        let foreign = pinned
+                            .read()
+                            .as_deref()
+                            .is_some_and(|server| !server.eq_ignore_ascii_case(&msg.identity_key));
+                        if foreign {
+                            tracing::warn!(claimed = %msg.identity_key,
+                                "authsocket client: dropped a frame from an identity other than the connected server");
+                            return;
                         }
                         let _ = tx.send(msg).await;
                     }
@@ -694,45 +719,55 @@ impl AuthSocketClient {
             }
         }
 
-        // Client-initiated BRC-103 handshake. Legacy/default mode retains the
-        // original single send_message("") path exactly. Provider mode first
-        // establishes the session, waits for any requested response to be sent,
-        // and only then sends the first `authenticated` general message.
+        // Client-initiated BRC-103 handshake. Both modes establish the one
+        // session first and pin it: its identity is the server identity
+        // (verified by the handshake signature, never read from an unverified
+        // frame), and every event this client signs names that exact session
+        // by its nonce. Provider mode then waits for any requested certificate
+        // response to be sent; only then is the first `authenticated` general
+        // message sent.
         let auth_payload = encode_event("authenticated", &json!({ "identityKey": identity_key }));
-        let handshake_result = if certificate_provider_configured {
-            match peer.get_authenticated_session("").await {
-                Ok(session) => {
-                    if certificate_requested.load(Ordering::SeqCst) {
-                        match tokio::time::timeout(
-                            options.authentication_success_timeout,
-                            certificate_result_rx.recv(),
-                        )
-                        .await
-                        {
-                            Ok(Some(Ok(()))) => {
-                                peer.send_message(&session.peer_identity_key, auth_payload)
-                                    .await
-                            }
-                            Ok(Some(Err(error))) => Err(AuthError::TransportError(format!(
-                                "certificate provisioning failed: {error}"
-                            ))),
-                            Ok(None) => Err(AuthError::TransportError(
-                                "certificate provider completion channel closed".into(),
-                            )),
-                            Err(_) => Err(AuthError::TransportError(format!(
-                                "certificate response was not sent within {}s",
-                                options.authentication_success_timeout.as_secs_f64()
-                            ))),
-                        }
-                    } else {
-                        peer.send_message(&session.peer_identity_key, auth_payload)
-                            .await
-                    }
-                }
-                Err(error) => Err(error),
+        let send_on_session = |session: PeerSession, payload: Vec<u8>| {
+            let peer = peer.clone();
+            let client = client.clone();
+            async move {
+                let message = peer
+                    .create_general_message(&session.session_nonce, payload)
+                    .await?;
+                emit_auth_message(&client, &message)
+                    .await
+                    .map_err(AuthError::TransportError)
             }
-        } else {
-            peer.send_message("", auth_payload).await
+        };
+        let mut pinned_session: Option<PeerSession> = None;
+        let handshake_result = match peer.get_authenticated_session("").await {
+            Ok(session) => {
+                *pinned_server.write() = Some(session.peer_identity_key.clone());
+                pinned_session = Some(session.clone());
+                if certificate_provider_configured && certificate_requested.load(Ordering::SeqCst) {
+                    match tokio::time::timeout(
+                        options.authentication_success_timeout,
+                        certificate_result_rx.recv(),
+                    )
+                    .await
+                    {
+                        Ok(Some(Ok(()))) => send_on_session(session, auth_payload).await,
+                        Ok(Some(Err(error))) => Err(AuthError::TransportError(format!(
+                            "certificate provisioning failed: {error}"
+                        ))),
+                        Ok(None) => Err(AuthError::TransportError(
+                            "certificate provider completion channel closed".into(),
+                        )),
+                        Err(_) => Err(AuthError::TransportError(format!(
+                            "certificate response was not sent within {}s",
+                            options.authentication_success_timeout.as_secs_f64()
+                        ))),
+                    }
+                } else {
+                    send_on_session(session, auth_payload).await
+                }
+            }
+            Err(error) => Err(error),
         };
         if let Err(e) = handshake_result {
             abandon(client, connected, dead).await;
@@ -752,26 +787,25 @@ impl AuthSocketClient {
             return Err(ClientError::Handshake(message));
         }
 
-        // The server identity key captured by the authMessage callback.
-        let server_identity_key = match server_key_rx.try_recv() {
-            Ok(k) => k,
-            Err(_) => {
-                abandon(client, connected, dead).await;
-                return Err(ClientError::Handshake(
-                    "handshake completed but server identity key not captured".into(),
-                ));
-            }
+        let Some(session) = pinned_session else {
+            abandon(client, connected, dead).await;
+            return Err(ClientError::Handshake(
+                "handshake completed without an authenticated session".into(),
+            ));
         };
+        let server_identity_key = session.peer_identity_key.clone();
 
-        // Type-erased signer: N concurrent sends sign in parallel.
+        // Type-erased signer: N concurrent sends sign in parallel, always on
+        // the pinned session (by its nonce, not by identity, so no other
+        // session can ever be selected).
         let signer: Signer = {
             let peer_for_signer = peer.clone();
-            let server_key = server_identity_key.clone();
+            let session_nonce = session.session_nonce.clone();
             Arc::new(move |payload: Vec<u8>| {
                 let peer = peer_for_signer.clone();
-                let server_key = server_key.clone();
+                let session_nonce = session_nonce.clone();
                 Box::pin(async move {
-                    peer.create_general_message(&server_key, payload)
+                    peer.create_general_message(&session_nonce, payload)
                         .await
                         .map_err(|e| e.to_string())
                 })
@@ -884,11 +918,19 @@ impl AuthSocketClient {
             let connected_for_dispatch = connected.clone();
             let dead_for_dispatch = dead.clone();
             let last_inbound_for_dispatch = last_inbound_ms.clone();
+            let pinned_for_dispatch = server_identity_key.clone();
             let mut general_msg_rx = general_msg_rx;
             tokio::spawn(async move {
                 loop {
                     match general_msg_rx.recv().await {
-                        Some((_sender_key, payload_bytes)) => {
+                        Some((sender_key, payload_bytes)) => {
+                            // rust-mpc#458 D3: only the connected server's
+                            // verified events reach a handler.
+                            if !sender_key.eq_ignore_ascii_case(&pinned_for_dispatch) {
+                                tracing::warn!(sender = %sender_key,
+                                    "authsocket client: dropped a verified event from an identity other than the connected server");
+                                continue;
+                            }
                             // Any decoded general message is proof of life.
                             last_inbound_for_dispatch.store(now_ms(), Ordering::SeqCst);
                             let Some((event_name, data)) = decode_event(&payload_bytes) else {
@@ -906,8 +948,11 @@ impl AuthSocketClient {
                                 }
                             }
                             let handler = { handlers.lock().await.get(&event_name).cloned() };
-                            if let Some(h) = handler {
-                                h(data);
+                            if let Some(handler) = handler {
+                                match handler {
+                                    Handler::Data(h) => h(data),
+                                    Handler::Verified(h) => h(sender_key, data),
+                                }
                             } else if let Some(f) = fallback.lock().await.clone() {
                                 f(event_name, data);
                             }
@@ -1030,7 +1075,16 @@ impl AuthSocketClient {
         self.handlers
             .lock()
             .await
-            .insert(event_name.into(), handler);
+            .insert(event_name.into(), Handler::Data(handler));
+    }
+
+    /// Register an exact-match handler that also receives the event's
+    /// BRC-103-verified sender key. Replaces any handler for the same event.
+    pub async fn on_verified(&self, event_name: impl Into<String>, handler: VerifiedEventHandler) {
+        self.handlers
+            .lock()
+            .await
+            .insert(event_name.into(), Handler::Verified(handler));
     }
 
     /// Remove an exact-match handler.
