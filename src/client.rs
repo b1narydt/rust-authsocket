@@ -7,12 +7,14 @@
 //!
 //! - [`SocketIOTransport`] — the SDK `Transport` over a `rust_socketio` client.
 //! - [`AuthSocketClient::connect`] — WebSocket-first connect, namespace
-//!   connect-ack gate, client-initiated BRC-103 handshake
-//!   (`peer.send_message("", authenticated-payload)`), `authenticationSuccess`
-//!   oneshot.
+//!   connect-ack gate, client-initiated BRC-103 handshake that pins the one
+//!   server session (its identity and nonce), `authenticationSuccess` oneshot.
+//!   The client never answers a handshake it did not start, and drops every
+//!   frame and verified event from any identity but that server
+//!   (rust-mpc#458 D3).
 //! - the SDK-owned background receiver, the general-message dispatcher
-//!   (verified events → `on(event)` handlers or the fallback), the keepalive
-//!   probe and the read-deadline watchdog.
+//!   (verified events → `on(event)` / `on_verified(event)` handlers or the
+//!   fallback), the keepalive probe and the read-deadline watchdog.
 //! - PROMPT DEATH DETECTION: the Socket.IO `error` callback wakes the keepalive
 //!   for an immediate probe emit, so `is_connected()` tells the truth within
 //!   milliseconds of a peer that vanished without a protocol goodbye (SIGKILL,
@@ -1064,8 +1066,9 @@ impl AuthSocketClient {
         now_ms().saturating_sub(self.last_inbound_ms.load(Ordering::SeqCst))
     }
 
-    /// The server's BRC-103 identity key captured during the handshake
-    /// (66-char compressed pubkey hex).
+    /// The server's BRC-103 identity key, from the authenticated handshake
+    /// session (66-char compressed pubkey hex). Every event this client hands
+    /// a handler was verified as sent by this key.
     pub fn server_identity_key(&self) -> &str {
         &self.server_identity_key
     }
