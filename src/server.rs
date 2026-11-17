@@ -297,6 +297,19 @@ fn deferred_event_bytes(event: &VerifiedEvent) -> usize {
 /// Arguments are `(socket_id, requester_identity_key, requested_certificates)`.
 /// Like the SDK listener, this callback is synchronous and may spawn async work
 /// that calls [`AuthSocketServer::send_certificate_response`].
+/// Decides whether a BRC-103-verified identity may hold a connection
+/// (rust-mpc#458 D4). Consulted on each connection's first verified event.
+pub type IdentityAuthorizer = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// Connection caps for one server (rust-mpc#458 D4). `0` means no cap.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConnectionLimits {
+    /// Sockets held at once, verified or not.
+    pub max_total: usize,
+    /// Sockets whose verified identity is the same key.
+    pub max_per_identity: usize,
+}
+
 pub type OnCertificatesRequested =
     dyn Fn(String, String, RequestedCertificateSet) + Send + Sync + 'static;
 
@@ -308,6 +321,9 @@ struct Connection<W: WalletInterface + 'static> {
     /// Set exclusively from a verified general-message sender — never from the
     /// unverified envelope claim.
     identity_key: RwLock<Option<String>>,
+    /// Set once the identity authorizer and the per-identity cap admitted this
+    /// connection's verified identity.
+    identity_admitted: AtomicBool,
     /// Identity recorded by the SDK for this socket's successfully processed
     /// responder-side BRC-103 session. Certificate responses must be signed by
     /// this same key before application authorization can accept them.
@@ -403,6 +419,10 @@ pub struct AuthSocketServer<W: WalletInterface + 'static> {
     certificate_request_listeners: Arc<RwLock<HashMap<u64, Arc<OnCertificatesRequested>>>>,
     certificate_request_listener_id: AtomicU64,
     connection_generation: AtomicU64,
+    identity_authorizer: RwLock<Option<IdentityAuthorizer>>,
+    connection_limits: RwLock<ConnectionLimits>,
+    /// Serializes connection-cap check-and-admit decisions.
+    admission: Mutex<()>,
 }
 
 impl<W: WalletInterface + 'static> Default for AuthSocketServer<W> {
@@ -426,7 +446,84 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
             certificate_request_listeners: Arc::new(RwLock::new(HashMap::new())),
             certificate_request_listener_id: AtomicU64::new(0),
             connection_generation: AtomicU64::new(0),
+            identity_authorizer: RwLock::new(None),
+            connection_limits: RwLock::new(ConnectionLimits::default()),
+            admission: Mutex::new(()),
         }
+    }
+
+    /// Admit only identities `authorizer` accepts. A connection whose first
+    /// verified event comes from a refused identity is closed before that
+    /// event (or any later one) is handled, including the generic
+    /// `authenticated` keepalive and room verbs.
+    pub fn set_identity_authorizer<F>(&self, authorizer: F)
+    where
+        F: Fn(&str) -> bool + Send + Sync + 'static,
+    {
+        *self.identity_authorizer.write() = Some(Arc::new(authorizer));
+    }
+
+    /// Cap connections in total and per verified identity.
+    pub fn set_connection_limits(&self, limits: ConnectionLimits) {
+        *self.connection_limits.write() = limits;
+    }
+
+    /// Sockets currently registered.
+    pub fn connection_count(&self) -> usize {
+        self.conns.read().len()
+    }
+
+    /// [`Self::add_connection`] unless the total cap is reached, in which case
+    /// nothing is registered and `None` is returned.
+    pub fn try_add_connection(
+        &self,
+        socket_id: impl Into<String>,
+        wallet: W,
+    ) -> Option<ConnectionId> {
+        let _admission = self.admission.lock();
+        let max_total = self.connection_limits.read().max_total;
+        if max_total > 0 && self.conns.read().len() >= max_total {
+            return None;
+        }
+        Some(self.add_connection(socket_id, wallet))
+    }
+
+    /// Admit `sender` as this connection's identity: once per connection, the
+    /// identity authorizer must accept it and the per-identity cap must have
+    /// room. Later events must come from the same admitted identity.
+    pub fn admit_identity(&self, id: &ConnectionId, sender: &str) -> Result<(), String> {
+        let Some(conn) = self.conn_for_id(id) else {
+            return Err("connection is not current".into());
+        };
+        if conn.identity_admitted.load(Ordering::Acquire) {
+            return match conn.identity_key.read().as_deref() {
+                Some(admitted) if admitted == sender => Ok(()),
+                _ => Err("verified sender differs from the admitted identity".into()),
+            };
+        }
+        let authorizer = self.identity_authorizer.read().clone();
+        if authorizer.is_some_and(|allow| !allow(sender)) {
+            return Err("identity is not allowed".into());
+        }
+        let _admission = self.admission.lock();
+        let max_per_identity = self.connection_limits.read().max_per_identity;
+        if max_per_identity > 0 {
+            let held = self
+                .conns
+                .read()
+                .values()
+                .filter(|other| {
+                    other.id != *id
+                        && other.identity_admitted.load(Ordering::Acquire)
+                        && other.identity_key.read().as_deref() == Some(sender)
+                })
+                .count();
+            if held >= max_per_identity {
+                return Err("per-identity connection cap reached".into());
+            }
+        }
+        conn.identity_admitted.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Set certificate types that every subsequently-created peer requests in
@@ -572,6 +669,7 @@ impl<W: WalletInterface + 'static> AuthSocketServer<W> {
             lifecycle_changed: tokio::sync::Notify::new(),
             handle: PeerHandle::new_for_server(wallet, requested),
             identity_key: RwLock::new(None),
+            identity_admitted: AtomicBool::new(false),
             session_peer_identity_key: RwLock::new(None),
             certificate_authorization: RwLock::new(authorization),
             certificate_deadline,

@@ -86,7 +86,14 @@ pub fn attach<W, F, D>(
         // Register the BRC-103 session for this socket up front, so the first
         // inbound frame always finds its PeerHandle.
         let connection_id = match wallet_factory() {
-            Ok(wallet) => server.add_connection(&sid, wallet),
+            Ok(wallet) => match server.try_add_connection(&sid, wallet) {
+                Some(connection_id) => connection_id,
+                None => {
+                    warn!(sid = %sid, "authsocket: connection cap reached — closing socket");
+                    socket.disconnect().ok();
+                    return;
+                }
+            },
             Err(e) => {
                 warn!(sid = %sid, error = %e, "authsocket: wallet factory failed — closing socket");
                 socket.disconnect().ok();
@@ -337,6 +344,16 @@ async fn dispatch_admitted_events<W>(
         if !server.is_current_connection(connection_id) {
             debug!(sid = %sid, generation = connection_id.generation(),
                 "authsocket: remaining superseded verified events dropped");
+            return;
+        }
+        // rust-mpc#458 D4: the identity authorizer and the per-identity cap
+        // decide on the first verified event, before any verb is handled.
+        if let Err(reason) = server.admit_identity(connection_id, &event.sender) {
+            warn!(sid = %sid, sender = %event.sender, reason = %reason,
+                "authsocket: identity not admitted — closing socket");
+            if server.remove_connection_if_current(connection_id) {
+                socket.clone().disconnect().ok();
+            }
             return;
         }
         handle_verified_event(io, &server, socket, sid, event, dispatcher).await;
